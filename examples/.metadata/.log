@@ -1,0 +1,18 @@
+!SESSION 2026-06-01 08:17:30.020 -----------------------------------------------
+eclipse.buildId=Version 2.1.1
+java.version=21.0.9
+java.vendor=Eclipse Adoptium
+BootLoader constants: OS=linux, ARCH=x86_64, WS=gtk, NL=en_US
+Command-line arguments:  -os linux -ws gtk -arch x86_64
+
+!ENTRY com.st.stm32cube.ide.mcu.informationcenter 1 1 2026-06-01 08:17:58.279
+!MESSAGE Log4j2 initialized with config file /home/lth/src/stm32-esp32-wifi/examples/.metadata/.log4j2.xml
+
+!ENTRY com.st.stm32cube.ide.mcu.ide 1 1 2026-06-01 08:18:03.150
+!MESSAGE Started RMI Server, listening on port 41337
+
+!ENTRY org.eclipse.cdt.core 1 0 2026-06-01 08:18:33.086
+!MESSAGE Indexed 'sl_mcu_stm32f407_first' (21 sources, 119 headers) in 3.86 sec: 11,802 declarations; 48,250 references; 1 unresolved inclusions; 92 syntax errors; 240 unresolved names (0.4%)
+
+!ENTRY org.eclipse.cdt.core 1 0 2026-06-01 08:20:55.848
+!MESSAGE Indexed 'sl_mcu_stm32f407_first' (21 sources, 119 headers) in 2.55 sec: 11,802 declarations; 48,250 references; 1 unresolved inclusions; 92 syntax errors; 240 unresolved names (0.4%)
