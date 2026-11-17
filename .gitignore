@@ -56,3 +56,24 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# ESP-IDF coprocessor build output
+coprocessor/build*/
+coprocessor/sdkconfig
+coprocessor/sdkconfig.esp32*
+coprocessor/sdkconfig.old
+coprocessor/managed_components/
+coprocessor/dependencies.lock
+
+# Eclipse / STM32CubeIDE workspace metadata
+.metadata/
+
+# Local Claude notes
+CLAUDE.local.md
+
+# Local Wi-Fi credentials
+wifi_secrets.h
+
+# STM32CubeIDE build output (regenerated from .cproject)
+examples/*/Debug/
+examples/*/Release/

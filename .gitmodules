@@ -1,0 +1,6 @@
+[submodule "esp-hosted-mcu"]
+	path = esp_hosted
+	url = https://github.com/espressif/esp-hosted-mcu.git
+[submodule "lwip"]
+	path = lwip
+	url = https://github.com/lwip-tcpip/lwip.git
