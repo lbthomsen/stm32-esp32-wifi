@@ -28,10 +28,11 @@ The ESP32-S3 coprocessor firmware builds and boots but hasn't been tested with t
 ## Layout
 
 ```text
-coprocessor/                     ESP-IDF project for the ESP32 side (S3 and C3)
-esp_hosted/                      submodule: ESP-Hosted v3.1.0 (ESP side only)
-lwip/                            submodule: lwIP STABLE-2_2_1_RELEASE (STM32 side)
-examples/sl_mcu_stm32f407_first  STM32CubeIDE project, STM32F407 host
+coprocessor/                      ESP-IDF project for the ESP32 side (S3 and C3)
+esp_hosted/                       submodule: ESP-Hosted v3.1.0 (ESP side only)
+lwip/                             submodule: lwIP STABLE-2_2_1_RELEASE (STM32 side)
+examples/sl_mcu_stm32f407_hosted  STM32CubeIDE project, STM32F407 host (ESP-Hosted, lwIP on the STM32)
+examples/sl_mcu_stm32f407_at      STM32CubeIDE project, STM32F407 host (ESP-AT over SPI, work in progress)
 ```
 
 | Submodule    | Used by       | Version                | Upstream                                        |
@@ -115,13 +116,13 @@ chip in download mode (`boot:0x0 ... waiting for download`). Press RST and use `
 
 ## STM32 host
 
-`examples/sl_mcu_stm32f407_first` is an STM32CubeIDE project for the STM32F407VET6.
+`examples/sl_mcu_stm32f407_hosted` is an STM32CubeIDE project for the STM32F407VET6.
 
 ### Building
 
 Open the `examples` folder as the workspace in STM32CubeIDE (tested with 2.2.0) and build
-`sl_mcu_stm32f407_first`. lwIP is linked into the project from the `lwip` submodule
-(`../../lwip/src`), so the submodules must be checked out.
+`sl_mcu_stm32f407_hosted`. lwIP comes into the project through a symlink, `lwip -> ../../lwip/src`,
+so the submodules must be checked out.
 
 The Wi-Fi credentials are not in git. Create `Core/Inc/wifi_secrets.h`:
 
@@ -138,13 +139,13 @@ The Wi-Fi credentials are not in git. Create `Core/Inc/wifi_secrets.h`:
 The project can also be built without the IDE, using a scratch workspace (doesn't touch an open IDE):
 
 ```bash
-~/st/stm32cubeide_2.2.0/stm32cubeide --launcher.suppressErrors -nosplash -application org.eclipse.cdt.managedbuilder.core.headlessbuild -data /tmp/cubeide_ws -import examples/sl_mcu_stm32f407_first -build sl_mcu_stm32f407_first/Debug
+~/st/stm32cubeide_2.2.0/stm32cubeide --launcher.suppressErrors -nosplash -application org.eclipse.cdt.managedbuilder.core.headlessbuild -data /tmp/cubeide_ws -import examples/sl_mcu_stm32f407_hosted -build sl_mcu_stm32f407_hosted/Debug
 ```
 
 Flash with openocd (or from the IDE):
 
 ```bash
-openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "program examples/sl_mcu_stm32f407_first/Debug/sl_mcu_stm32f407_first.elf verify reset exit"
+openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "program examples/sl_mcu_stm32f407_hosted/Debug/sl_mcu_stm32f407_hosted.elf verify reset exit"
 ```
 
 The log goes to USART1 (PA9/PA10) at 921600 baud.
