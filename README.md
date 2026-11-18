@@ -18,6 +18,11 @@ Tested with an ESP32-C3 (YD-ESP32-C3) and an STM32F407VET6:
 - Ping round trip around 10 ms. The host turns the ESP's Wi-Fi power save off (`WIFI_PS_NONE`),
   which costs extra current on the ESP. With the default modem sleep it's 30 to 230 ms.
 
+Known issue: the YD-ESP32-C3 only runs Wi-Fi with a USB cable on one of its ports. Powered from 3.3 V
+on the backplane alone, it boots and completes the host handshake, but its brownout supervisor resets
+it as soon as the radio starts (`rst:0xf (BROWNOUT_RST)` at `phy_init`), even with the brownout
+detector disabled in software and the TX power capped at 10 dBm.
+
 The ESP32-S3 coprocessor firmware builds and boots but hasn't been tested with the STM32 host yet.
 
 ## Layout

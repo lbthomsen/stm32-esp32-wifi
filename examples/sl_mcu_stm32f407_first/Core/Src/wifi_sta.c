@@ -18,6 +18,8 @@
 #define WIFI_PS_NONE            0   // radio always on: low latency, more current
 #define SCAN_MAX_RECORDS        16
 #define RETRY_DELAY_MS          5000
+#define NOT_INIT_RETRY_MS       500
+#define ESP_ERR_WIFI_NOT_INIT   0x3001  // CP announced itself before its app_main ran esp_wifi_init()
 
 /* wifi_event_t values (IDF esp_wifi_types.h) for Event_WifiEventNoArgs */
 static const char* wifi_event_name(int32_t id) {
@@ -44,10 +46,19 @@ static uint8_t mac[6];
 static uint8_t cp_up;
 static uint8_t scan_done;
 static uint32_t retry_tick;
+static uint32_t retry_delay;
+static wifi_sta_state_t retry_state;
 static uint8_t req_in_flight;
 
 static void set_state(wifi_sta_state_t s) {
     state = s;
+}
+
+static void retry_later(wifi_sta_state_t s, uint32_t delay_ms) {
+    retry_state = s;
+    retry_delay = delay_ms;
+    retry_tick = HAL_GetTick();
+    set_state(WIFI_STA_RETRY_WAIT);
 }
 
 static int32_t resp_code(const uint8_t *body, size_t len, uint32_t field) {
@@ -75,7 +86,11 @@ static void on_simple_resp(esp_rpc_status_t status, uint16_t msg_id, const uint8
     switch (state) {
     case WIFI_STA_SET_MODE:
         printf("wifi_sta: set mode STA -> %ld\n", resp);
-        set_state(resp ? WIFI_STA_ERROR : WIFI_STA_GET_MAC);
+        if (resp == ESP_ERR_WIFI_NOT_INIT) {
+            retry_later(WIFI_STA_SET_MODE, NOT_INIT_RETRY_MS);
+        } else {
+            set_state(resp ? WIFI_STA_ERROR : WIFI_STA_GET_MAC);
+        }
         break;
     case WIFI_STA_START:
         printf("wifi_sta: wifi start -> %ld\n", resp);
@@ -266,8 +281,7 @@ void wifi_sta_rpc_event(uint16_t msg_id, const uint8_t *body, size_t len) {
             }
         }
         printf("wifi_sta: disconnected, reason %lu - retrying in %u s\n", reason, RETRY_DELAY_MS / 1000);
-        retry_tick = HAL_GetTick();
-        set_state(WIFI_STA_RETRY_WAIT);
+        retry_later(WIFI_STA_CONNECT, RETRY_DELAY_MS);
         break;
     }
 
@@ -369,8 +383,8 @@ void wifi_sta_poll(void) {
         break;
 
     case WIFI_STA_RETRY_WAIT:
-        if (HAL_GetTick() - retry_tick > RETRY_DELAY_MS) {
-            set_state(WIFI_STA_CONNECT);
+        if (HAL_GetTick() - retry_tick > retry_delay) {
+            set_state(retry_state);
         }
         break;
 

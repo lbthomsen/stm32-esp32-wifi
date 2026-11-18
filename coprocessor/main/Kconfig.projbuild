@@ -1,0 +1,12 @@
+menu "Coprocessor board"
+
+    config CP_RGB_LED_GPIO
+        int "GPIO of the board's WS2812 RGB LED (-1 if none)"
+        default -1
+        range -1 48
+        help
+            Many dev boards have a WS2812 RGB LED that can come up lit after a
+            reset. If set, the firmware sends it an "off" frame at boot and then
+            holds the data line low.
+
+endmenu
