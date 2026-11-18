@@ -6,7 +6,7 @@ each way of splitting the work:
 | Example                      | ESP firmware                                                  | TCP/IP runs on | STM32 flash |
 | :--------------------------- | :------------------------------------------------------------ | :------------- | :---------- |
 | `sl_mcu_stm32f407_hosted`    | [ESP-Hosted](https://github.com/espressif/esp-hosted-mcu) (SPI full duplex) | STM32 (lwIP)   | ~66 KB      |
-| `sl_mcu_stm32f407_at`        | [ESP-AT](https://github.com/espressif/esp-at) (SPI half duplex) | ESP          | ~19 KB      |
+| `sl_mcu_stm32f407_at`        | [ESP-AT](https://github.com/espressif/esp-at) (SPI half duplex) | ESP          | ~28 KB      |
 
 With ESP-Hosted the ESP is a Wi-Fi network interface: Ethernet frames go over SPI and
 [lwIP](https://savannah.nongnu.org/projects/lwip/) runs on the STM32. With ESP-AT the ESP keeps the
@@ -31,9 +31,13 @@ ESP-Hosted (`sl_mcu_stm32f407_hosted`), tested with an ESP32-C3 (YD-ESP32-C3) an
 ESP-AT (`sl_mcu_stm32f407_at`), same boards, ESP-AT v5.0.1.0 on the C3:
 
 - SPI link (half duplex, handshake), AT commands, modem sleep off, DHCP hostname, join
-- Ping round trip around 4 to 9 ms (answered by the ESP)
-- TCP echo server on port 7: up to 8000 bytes per round trip echoed back intact, about 1.2 Mbit/s
-  each way
+- Interrupt-driven SPI: the handshake interrupt and SPI DMA completions run every transfer, the
+  main loop only parses AT lines and runs the services
+- Ping round trip around 3 to 9 ms (answered by the ESP)
+- Web server on port 80: `GET /` returns a status page (time, NIST sync, uptime, Wi-Fi RSSI, IP, SPI
+  counters), refreshing every 10 s
+- UTC time from NIST's daytime service (`time.nist.gov`, TCP port 13) at start-up and every 10
+  minutes, kept between syncs on the STM32's tick
 - Link supervision: an ESP restart (`ready`) or a silent ESP (`AT` probe after 10 s) resets it
   through EN and rejoins
 
@@ -281,7 +285,8 @@ wifi_at: < WIFI CONNECTED
 wifi_at: < WIFI GOT IP
 wifi_at: join "stm32" -> OK
 wifi_at: ip 10.1.128.120
-wifi_at: TCP echo server on port 7 -> OK
+wifi_at: TCP server on port 80 -> OK
+daytime: 2026-11-18 08:40:19 UTC from time.nist.gov
 ```
 
 (ESP-AT joins with the credentials it stored last time before the STM32 asks, hence the extra
@@ -353,12 +358,37 @@ is around 66 KB of flash.
 
 | File                | What it does                                                                 |
 | :------------------ | :--------------------------------------------------------------------------- |
-| `at_spi.c`          | ESP-AT SPI transport (half duplex, handshake), byte streams both ways        |
+| `at_spi.c`          | ESP-AT SPI transport (half duplex, handshake), interrupt driven, byte streams both ways |
 | `at_client.c`       | AT commands and responses, unsolicited lines, `+IPD` socket data, `CIPSEND`  |
-| `wifi_at.c`         | Station (hostname, join, IP), TCP echo server on port 7, link supervision    |
+| `wifi_at.c`         | Station (hostname, join, IP, RSSI), the TCP server, client connections, link ownership, link supervision |
+| `http_server.c`     | HTTP/1.0 status page on port 80                                              |
+| `daytime.c`         | NIST daytime client, UTC clock between syncs                                 |
 
 The protocol follows ESP-AT's reference SPI master, `esp_at/examples/at_spi_master`. The whole STM32
-image is around 19 KB of flash.
+image is around 28 KB of flash.
+
+How the work is split:
+
+- **Interrupts** move the bytes. A rising edge on the handshake line (EXTI4) starts a status read, and
+  each SPI DMA completion (DMA2 streams 0 and 3) starts the next transaction of the sequence: read
+  the data, say "read done", or write the data the ESP is ready for. Each transaction is one full
+  duplex DMA transfer of the 3 header bytes plus the data. The DMA streams are set up in `at_spi.c`
+  rather than in CubeMX, so regenerating the project leaves them alone. Don't enable SPI1 DMA in
+  CubeMX as well.
+- **The main loop** parses what arrived and runs the services. `wifi_at` hands each link's connect,
+  data and close events to the service that owns it: incoming connections go to the HTTP server,
+  and the daytime client gets the link it opened. The HTTP server collects the request as its data
+  arrives and replies once the headers are complete. One AT command runs at a time.
+
+ESP-AT allows one TCP server and five links in all. The server is limited to four connections
+(`AT+CIPSERVERMAXCONN=4`), so a link stays free for the daytime client.
+
+Known limit: ESP-AT accepts only one or two connections from a burst at once. With eight
+simultaneous requests the rest get in as the client retries (1 s, 2 s, ...). A browser opening the
+page uses at most two (the page and `favicon.ico`, which gets a 404).
+
+NIST asks clients to query no more than once every 4 seconds; every 10 minutes is well inside that.
+The time on the page is to the second (the daytime format has no fractions).
 
 ### Wiring
 

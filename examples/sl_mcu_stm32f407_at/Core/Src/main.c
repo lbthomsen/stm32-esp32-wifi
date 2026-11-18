@@ -25,6 +25,8 @@
 #include "at_spi.h"
 #include "at_client.h"
 #include "wifi_at.h"
+#include "http_server.h"
+#include "daytime.h"
 #include "wifi_secrets.h"
 
 /* USER CODE END Includes */
@@ -113,7 +115,7 @@ int main(void)
 
     printf("\n\n\nStarting Wi-Fi (ESP-AT)\n");
 
-    wifi_at_init(WIFI_SSID, WIFI_PASSWORD);
+    wifi_at_init(WIFI_SSID, WIFI_PASSWORD, HTTP_SERVER_PORT, &http_server_handler);
     at_spi_init(&hspi1);
 
   /* USER CODE END 2 */
@@ -134,16 +136,18 @@ int main(void)
 
         if (now >= next_status) {
             const at_spi_stats_t *st = at_spi_get_stats();
-            printf("status: up %lu s, %s ip %s, state %d, spi xfer %lu tx %lu rx %lu, errors seq %lu len %lu spi %lu ovf %lu\n",
+            printf("status: up %lu s, %s ip %s, state %d, spi xfer %lu tx %lu rx %lu, errors seq %lu len %lu spi %lu ovf %lu, stale %lu\n",
                     now / 1000, wifi_at_get_hostname(), wifi_at_get_ip(), wifi_at_get_state(),
                     st->transactions, st->tx_bytes, st->rx_bytes,
-                    st->seq_errors, st->len_errors, st->spi_errors, st->rx_overflows);
+                    st->seq_errors, st->len_errors, st->spi_errors, st->rx_overflows, st->stale_status);
             next_status = now + 30000;
         }
 
-        at_spi_poll();
-        at_client_poll();
-        wifi_at_poll();
+        at_spi_poll();          // safety net; the SPI transfers run from interrupts
+        at_client_poll();       // AT lines and socket data from the ESP
+        wifi_at_poll();         // Wi-Fi join, server, liveness
+        http_server_poll();     // replies to requests that have come in
+        daytime_poll();         // NIST time every 10 minutes
 
     /* USER CODE END WHILE */
 

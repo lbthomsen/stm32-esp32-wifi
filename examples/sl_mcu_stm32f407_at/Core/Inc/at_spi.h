@@ -8,7 +8,8 @@
  * the ESP has for it or writes the data it asked to send.
  *
  * The transport moves a plain byte stream in both directions; the AT layer
- * on top splits it into lines.
+ * on top splits it into lines. The transfers run from interrupts (HS EXTI
+ * and SPI DMA completion); the main loop only fills and empties the rings.
  */
 
 #ifndef AT_SPI_H_
@@ -30,6 +31,7 @@ typedef struct {
     uint32_t len_errors;
     uint32_t spi_errors;
     uint32_t rx_overflows;
+    uint32_t stale_status;      // status reads that repeated an already read packet (skipped)
 } at_spi_stats_t;
 
 void at_spi_init(SPI_HandleTypeDef *hspi);
@@ -37,6 +39,7 @@ void at_spi_init(SPI_HandleTypeDef *hspi);
 // Pulse the ESP's EN pin (PA3, open drain) and drop all buffered data.
 void at_spi_reset_esp(void);
 
+// Safety net for missed edges and stuck transfers; call from the main loop.
 void at_spi_poll(void);
 
 // Queue bytes for the ESP. Returns the number accepted (may be less than len).

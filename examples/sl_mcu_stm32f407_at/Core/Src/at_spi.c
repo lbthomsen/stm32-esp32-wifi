@@ -1,5 +1,5 @@
 /*
- * at_spi.c - ESP-AT over SPI, host side transport (no RTOS).
+ * at_spi.c - ESP-AT over SPI, host side transport, interrupt driven (no RTOS).
  *
  * Follows esp_at/examples/at_spi_master (the reference SPI AT master):
  *  - SPI mode 0, half duplex. Every transaction: [cmd][addr][dummy][data...].
@@ -13,6 +13,16 @@
  *    {0xFE, seq, len16} and waits for the ESP to come back with direction 2.
  *  - Sequence numbers count up per direction; seq 1 after a mismatch means
  *    the ESP restarted.
+ *
+ * Everything on the wire runs from interrupts: the HS EXTI starts a status
+ * read, and each SPI DMA completion starts the next transaction of the
+ * sequence. Each transaction is one full duplex DMA transfer of the 3 header
+ * bytes plus the data (the bytes clocked in during the header are ignored).
+ * The main loop only moves bytes in and out of the two rings, and
+ * at_spi_poll() is a safety net (missed edges, stuck transfers).
+ *
+ * The DMA streams are set up here rather than in CubeMX, so regenerating
+ * the project can't undo them. Don't also enable SPI1 DMA in CubeMX.
  */
 
 #include <string.h>
@@ -28,32 +38,52 @@
 #define WRBUF_ADDR      0x00
 #define RDBUF_ADDR      0x04
 
-#define DIR_NONE        0
 #define DIR_READ        1       // ESP -> host
 #define DIR_WRITE       2       // host -> ESP
 
 #define WRITE_REQ_MAGIC 0xFE
 
-#define SPI_TIMEOUT_MS  50
+#define HDR_LEN         3
+#define XFER_TIMEOUT_MS 20      // a DMA transfer of 4 KB at 10.5 MHz takes ~3 ms
 #define HS_STUCK_MS     100     // HS high this long without a transaction: treat as an edge
 #define BOOT_HOLD_MS    100
 
+#define SPI_IRQ_PRIORITY 0      // same as the HS EXTI (CubeMX), so they never nest
+
+typedef enum {
+    XS_IDLE = 0,
+    XS_RD_STATUS,
+    XS_RD_DATA,
+    XS_RD_DONE,
+    XS_WR_REQ,
+    XS_WR_DATA,
+    XS_WR_DONE
+} xfer_state_t;
+
 static SPI_HandleTypeDef *spi;
+static DMA_HandleTypeDef dma_rx;
+static DMA_HandleTypeDef dma_tx;
 static at_spi_stats_t stats;
 
+// Rings: one side is the main loop, the other the interrupts.
 static uint8_t rx_ring[AT_SPI_RX_RING_SIZE];
-static size_t rx_head, rx_tail;     // head: write, tail: read
+static volatile size_t rx_head, rx_tail;    // head: written by IRQ, tail: by main
 static uint8_t tx_ring[AT_SPI_TX_RING_SIZE];
-static size_t tx_head, tx_tail;
+static volatile size_t tx_head, tx_tail;    // head: written by main, tail: by IRQ
 
-static uint8_t chunk[AT_SPI_MAX_CHUNK] __attribute__((aligned(4)));
+// DMA buffers (in SRAM, not CCM: the DMA can't reach CCM)
+static uint8_t dma_tx_buf[HDR_LEN + AT_SPI_MAX_CHUNK] __attribute__((aligned(4)));
+static uint8_t dma_rx_buf[HDR_LEN + AT_SPI_MAX_CHUNK] __attribute__((aligned(4)));
 
+static volatile xfer_state_t xstate;
 static volatile uint8_t hs_edge;
-static uint8_t send_seq;            // last write request sequence number
-static uint8_t recv_seq;            // last read sequence number
-static uint16_t planned_len;        // bytes promised in the outstanding write request
+static volatile uint32_t xfer_tick;     // start of the transfer in progress
+static volatile uint32_t last_xfer_tick;
+static uint8_t send_seq;                // last write request sequence number
+static uint8_t recv_seq;                // last read sequence number
+static uint16_t planned_len;            // bytes promised in the outstanding write request
+static uint16_t read_len;               // bytes the ESP announced
 static uint8_t write_requested;
-static uint32_t last_xfer_tick;
 static uint32_t reset_tick;
 
 static inline size_t ring_used(size_t head, size_t tail, size_t size) {
@@ -64,12 +94,6 @@ static inline int hs_active(void) {
     return HAL_GPIO_ReadPin(SPI1_HS_GPIO_Port, SPI1_HS_Pin) == GPIO_PIN_SET;
 }
 
-void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin) {
-    if (gpio_pin == SPI1_HS_Pin) {
-        hs_edge = 1;
-    }
-}
-
 static inline void cs_low(void) {
     HAL_GPIO_WritePin(SPI1_CS_GPIO_Port, SPI1_CS_Pin, GPIO_PIN_RESET);
 }
@@ -78,110 +102,230 @@ static inline void cs_high(void) {
     HAL_GPIO_WritePin(SPI1_CS_GPIO_Port, SPI1_CS_Pin, GPIO_PIN_SET);
 }
 
-// One half duplex transaction. Either tx or rx (or neither) carries data.
-static int xfer(uint8_t cmd, uint8_t addr, const uint8_t *tx, uint8_t *rx, uint16_t len) {
-    uint8_t hdr[3] = { cmd, addr, 0x00 };   // command, address, 8 dummy bits
-    HAL_StatusTypeDef st;
-
-    cs_low();
-    st = HAL_SPI_Transmit(spi, hdr, sizeof(hdr), SPI_TIMEOUT_MS);
-    if (st == HAL_OK && len) {
-        if (tx) {
-            st = HAL_SPI_Transmit(spi, (uint8_t*) tx, len, SPI_TIMEOUT_MS);
-        } else if (rx) {
-            st = HAL_SPI_Receive(spi, rx, len, SPI_TIMEOUT_MS);
-        }
-    }
-    cs_high();
-
+// Start one transaction. The data phase (if any) must already be in
+// dma_tx_buf + HDR_LEN. Called from interrupt context or with interrupts off.
+static void start(xfer_state_t s, uint8_t cmd, uint8_t addr, uint16_t data_len) {
+    dma_tx_buf[0] = cmd;
+    dma_tx_buf[1] = addr;
+    dma_tx_buf[2] = 0x00;       // dummy
+    xstate = s;
+    xfer_tick = HAL_GetTick();
     stats.transactions++;
-    last_xfer_tick = HAL_GetTick();
-    if (st != HAL_OK) {
+    cs_low();
+    if (HAL_SPI_TransmitReceive_DMA(spi, dma_tx_buf, dma_rx_buf, HDR_LEN + data_len) != HAL_OK) {
+        cs_high();
         stats.spi_errors++;
-        return -1;
-    }
-    return 0;
-}
-
-static void request_write(void) {
-    size_t pending = ring_used(tx_head, tx_tail, sizeof(tx_ring));
-    if (pending == 0 || write_requested) {
-        return;
-    }
-    planned_len = (uint16_t) (pending > AT_SPI_MAX_CHUNK ? AT_SPI_MAX_CHUNK : pending);
-    send_seq++;
-    uint8_t req[4] = { WRITE_REQ_MAGIC, send_seq, planned_len & 0xff, planned_len >> 8 };
-    if (xfer(CMD_WRBUF, WRBUF_ADDR, req, NULL, sizeof(req)) == 0) {
-        write_requested = 1;
+        xstate = XS_IDLE;
     }
 }
 
-static void do_read(uint8_t seq, uint16_t len) {
-    if (seq != (uint8_t) (recv_seq + 1)) {
-        stats.seq_errors++;     // seq 1 after a mismatch: the ESP restarted, carry on
-    }
-    if (len == 0 || len > AT_SPI_MAX_CHUNK) {
-        stats.len_errors++;
+static int tx_pending(void) {
+    return ring_used(tx_head, tx_tail, sizeof(tx_ring)) != 0;
+}
+
+// Start whatever needs doing next, if the bus is free.
+// Called from interrupt context or with interrupts off.
+static void kick(void) {
+    if (xstate != XS_IDLE || HAL_GetTick() - reset_tick < BOOT_HOLD_MS) {
         return;
     }
-    recv_seq = seq;
-
-    if (xfer(CMD_RDDMA, 0, NULL, chunk, len) != 0) {
+    if (hs_edge) {
+        hs_edge = 0;
+        memset(dma_tx_buf + HDR_LEN, 0, 4);
+        start(XS_RD_STATUS, CMD_RDBUF, RDBUF_ADDR, 4);
         return;
     }
-    xfer(CMD_RD_DONE, 0, NULL, NULL, 0);
+    if (tx_pending() && !write_requested) {
+        size_t pending = ring_used(tx_head, tx_tail, sizeof(tx_ring));
+        planned_len = (uint16_t) (pending > AT_SPI_MAX_CHUNK ? AT_SPI_MAX_CHUNK : pending);
+        send_seq++;
+        dma_tx_buf[HDR_LEN + 0] = WRITE_REQ_MAGIC;
+        dma_tx_buf[HDR_LEN + 1] = send_seq;
+        dma_tx_buf[HDR_LEN + 2] = planned_len & 0xff;
+        dma_tx_buf[HDR_LEN + 3] = planned_len >> 8;
+        start(XS_WR_REQ, CMD_WRBUF, WRBUF_ADDR, 4);
+    }
+}
 
-    for (uint16_t i = 0; i < len; ++i) {
-        size_t next = (rx_head + 1) % sizeof(rx_ring);
+static void kick_from_main(void) {
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    kick();
+    __set_PRIMASK(primask);
+}
+
+static void on_status(void) {
+    const uint8_t *st = dma_rx_buf + HDR_LEN;
+    uint8_t direction = st[0];
+    uint8_t seq = st[1];
+    uint16_t len = (uint16_t) (st[2] | (st[3] << 8));
+
+    if (direction == DIR_READ) {
+        if (seq == recv_seq && seq != 1) {
+            // The status of the packet we already read (an extra HS edge got
+            // us here before the ESP moved on). Reading again gives junk.
+            stats.stale_status++;
+            return;
+        }
+        if (seq != (uint8_t) (recv_seq + 1)) {
+            stats.seq_errors++;     // seq 1 after a mismatch: the ESP restarted, carry on
+        }
+        if (len == 0 || len > AT_SPI_MAX_CHUNK) {
+            stats.len_errors++;
+            return;
+        }
+        recv_seq = seq;
+        read_len = len;
+        memset(dma_tx_buf + HDR_LEN, 0, len);
+        start(XS_RD_DATA, CMD_RDDMA, 0, len);
+    } else if (direction == DIR_WRITE) {
+        if (!write_requested || planned_len == 0) {
+            return;
+        }
+        if (seq != send_seq) {
+            stats.seq_errors++;
+            if (seq != 1) {
+                return;
+            }
+            send_seq = seq;     // the ESP restarted and took our request as its first
+        }
+        size_t tail = tx_tail;
+        for (uint16_t i = 0; i < planned_len; ++i) {
+            dma_tx_buf[HDR_LEN + i] = tx_ring[tail];
+            tail = (tail + 1) % sizeof(tx_ring);
+        }
+        tx_tail = tail;
+        start(XS_WR_DATA, CMD_WRDMA, 0, planned_len);
+    }
+}
+
+static void on_read_data(void) {
+    size_t head = rx_head;
+    for (uint16_t i = 0; i < read_len; ++i) {
+        size_t next = (head + 1) % sizeof(rx_ring);
         if (next == rx_tail) {
             stats.rx_overflows++;
             break;
         }
-        rx_ring[rx_head] = chunk[i];
-        rx_head = next;
+        rx_ring[head] = dma_rx_buf[HDR_LEN + i];
+        head = next;
     }
-    stats.rx_bytes += len;
+    rx_head = head;
+    stats.rx_bytes += read_len;
+    start(XS_RD_DONE, CMD_RD_DONE, 0, 0);
 }
 
-static void do_write(uint8_t seq) {
-    if (!write_requested || planned_len == 0) {
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
+    if (hspi != spi) {
         return;
     }
-    if (seq != send_seq) {
-        stats.seq_errors++;
-        if (seq != 1) {
-            return;
-        }
-        send_seq = seq;         // the ESP restarted and took our request as its first
-    }
+    cs_high();
+    last_xfer_tick = HAL_GetTick();
 
-    // Copy the planned bytes out of the ring (it may wrap)
-    for (uint16_t i = 0; i < planned_len; ++i) {
-        chunk[i] = tx_ring[tx_tail];
-        tx_tail = (tx_tail + 1) % sizeof(tx_ring);
-    }
-    if (xfer(CMD_WRDMA, 0, chunk, NULL, planned_len) == 0) {
-        xfer(CMD_WR_DONE, 0, NULL, NULL, 0);
+    xfer_state_t done = xstate;
+    xstate = XS_IDLE;
+
+    switch (done) {
+    case XS_RD_STATUS:
+        on_status();
+        break;
+    case XS_RD_DATA:
+        on_read_data();
+        break;
+    case XS_WR_REQ:
+        write_requested = 1;
+        break;
+    case XS_WR_DATA:
         stats.tx_bytes += planned_len;
+        start(XS_WR_DONE, CMD_WR_DONE, 0, 0);
+        break;
+    case XS_WR_DONE:
+        write_requested = 0;
+        planned_len = 0;
+        break;
+    default:
+        break;
     }
-    write_requested = 0;
-    planned_len = 0;
+    kick();
+}
 
-    // More queued meanwhile: ask again
-    request_write();
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi) {
+    if (hspi != spi) {
+        return;
+    }
+    cs_high();
+    stats.spi_errors++;
+    xstate = XS_IDLE;
+    kick();
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin) {
+    if (gpio_pin == SPI1_HS_Pin) {
+        hs_edge = 1;
+        kick();
+    }
+}
+
+void DMA2_Stream0_IRQHandler(void) {
+    HAL_DMA_IRQHandler(&dma_rx);
+}
+
+void DMA2_Stream3_IRQHandler(void) {
+    HAL_DMA_IRQHandler(&dma_tx);
+}
+
+static void dma_init(void) {
+    __HAL_RCC_DMA2_CLK_ENABLE();
+
+    // SPI1_RX: DMA2 stream 0 channel 3, SPI1_TX: DMA2 stream 3 channel 3
+    dma_rx.Instance = DMA2_Stream0;
+    dma_rx.Init.Channel = DMA_CHANNEL_3;
+    dma_rx.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    dma_rx.Init.PeriphInc = DMA_PINC_DISABLE;
+    dma_rx.Init.MemInc = DMA_MINC_ENABLE;
+    dma_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    dma_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    dma_rx.Init.Mode = DMA_NORMAL;
+    dma_rx.Init.Priority = DMA_PRIORITY_HIGH;
+    dma_rx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    HAL_DMA_Init(&dma_rx);
+    __HAL_LINKDMA(spi, hdmarx, dma_rx);
+
+    dma_tx.Instance = DMA2_Stream3;
+    dma_tx.Init = dma_rx.Init;
+    dma_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
+    dma_tx.Init.Priority = DMA_PRIORITY_MEDIUM;
+    HAL_DMA_Init(&dma_tx);
+    __HAL_LINKDMA(spi, hdmatx, dma_tx);
+
+    HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, SPI_IRQ_PRIORITY, 0);
+    HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+    HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, SPI_IRQ_PRIORITY, 0);
+    HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
 }
 
 void at_spi_init(SPI_HandleTypeDef *hspi) {
     spi = hspi;
     memset(&stats, 0, sizeof(stats));
     cs_high();
+    dma_init();
     // Enable SPI1 now so SCK sits at its idle level before CS is ever asserted.
     __HAL_SPI_ENABLE(spi);
     at_spi_reset_esp();
 }
 
 void at_spi_reset_esp(void) {
+    // Stop the interrupt side first, then hold the ESP in reset.
+    HAL_NVIC_DisableIRQ(EXTI4_IRQn);
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (xstate != XS_IDLE) {
+        HAL_SPI_Abort(spi);
+        xstate = XS_IDLE;
+    }
     cs_high();
+    __set_PRIMASK(primask);
+
     HAL_GPIO_WritePin(SPI1_RST_GPIO_Port, SPI1_RST_Pin, GPIO_PIN_RESET);
     HAL_Delay(50);
     HAL_GPIO_WritePin(SPI1_RST_GPIO_Port, SPI1_RST_Pin, GPIO_PIN_SET);
@@ -195,47 +339,52 @@ void at_spi_reset_esp(void) {
     hs_edge = 0;
     reset_tick = HAL_GetTick();
     last_xfer_tick = reset_tick;
+    __HAL_GPIO_EXTI_CLEAR_IT(SPI1_HS_Pin);
+    HAL_NVIC_EnableIRQ(EXTI4_IRQn);
 }
 
 void at_spi_poll(void) {
     uint32_t now = HAL_GetTick();
-    if (now - reset_tick < BOOT_HOLD_MS) {
-        return;
+
+    // A transfer that never completed: abort it and carry on.
+    if (xstate != XS_IDLE && now - xfer_tick > XFER_TIMEOUT_MS) {
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        if (xstate != XS_IDLE) {
+            HAL_SPI_Abort(spi);
+            cs_high();
+            stats.spi_errors++;
+            xstate = XS_IDLE;
+        }
+        __set_PRIMASK(primask);
     }
 
     // Missed edge safety net: HS has been high for a while with nothing done.
-    if (!hs_edge && hs_active() && now - last_xfer_tick > HS_STUCK_MS) {
+    if (xstate == XS_IDLE && !hs_edge && hs_active() && now - last_xfer_tick > HS_STUCK_MS) {
         hs_edge = 1;
     }
 
-    if (hs_edge) {
-        hs_edge = 0;
-        uint8_t status[4];
-        if (xfer(CMD_RDBUF, RDBUF_ADDR, NULL, status, sizeof(status)) == 0) {
-            uint8_t direction = status[0];
-            uint8_t seq = status[1];
-            uint16_t len = (uint16_t) (status[2] | (status[3] << 8));
-            if (direction == DIR_READ) {
-                do_read(seq, len);
-            } else if (direction == DIR_WRITE) {
-                do_write(seq);
-            }
-        }
+    // Work that couldn't start from an interrupt (boot hold, new TX data, the above)
+    if (xstate == XS_IDLE && (hs_edge || (tx_pending() && !write_requested))) {
+        kick_from_main();
     }
-
-    request_write();
 }
 
 size_t at_spi_write(const void *data, size_t len) {
     const uint8_t *p = data;
     size_t n = 0;
+    size_t head = tx_head;
     while (n < len) {
-        size_t next = (tx_head + 1) % sizeof(tx_ring);
+        size_t next = (head + 1) % sizeof(tx_ring);
         if (next == tx_tail) {
             break;
         }
-        tx_ring[tx_head] = p[n++];
-        tx_head = next;
+        tx_ring[head] = p[n++];
+        head = next;
+    }
+    tx_head = head;
+    if (n) {
+        kick_from_main();
     }
     return n;
 }
@@ -247,10 +396,12 @@ size_t at_spi_tx_free(void) {
 size_t at_spi_read(void *data, size_t max) {
     uint8_t *p = data;
     size_t n = 0;
-    while (n < max && rx_tail != rx_head) {
-        p[n++] = rx_ring[rx_tail];
-        rx_tail = (rx_tail + 1) % sizeof(rx_ring);
+    size_t tail = rx_tail;
+    while (n < max && tail != rx_head) {
+        p[n++] = rx_ring[tail];
+        tail = (tail + 1) % sizeof(rx_ring);
     }
+    rx_tail = tail;
     return n;
 }
 
