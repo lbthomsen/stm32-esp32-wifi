@@ -1,0 +1,8 @@
+# Applied on top of esp_at/module_config/module_esp32c3-spi/sdkconfig.defaults
+# (at_firmware/build.sh sets AT_EXT_MODULE_CFG to this folder).
+#
+# SPI pins are ESP-AT's C3 defaults, which match our wiring:
+#   SCLK 6, MOSI 7, MISO 2, CS 10, handshake 3
+
+# Logs also on the USB-Serial-JTAG port (the board stays on USB, no UART probe)
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y

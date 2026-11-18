@@ -1,22 +1,41 @@
 # stm32-esp32-wifi
 
-Use an ESP32 as a Wi-Fi co-processor for an STM32 host, using
-[ESP-Hosted](https://github.com/espressif/esp-hosted-mcu) over SPI (full duplex).
+Use an ESP32 as a Wi-Fi co-processor for an STM32 host, over SPI. There are two examples, one for
+each way of splitting the work:
 
-The STM32 side runs no RTOS. It is a HAL superloop with a small host stack of its own that speaks
-the ESP-Hosted wire protocol, plus [lwIP](https://savannah.nongnu.org/projects/lwip/) in `NO_SYS` mode.
+| Example                      | ESP firmware                                                  | TCP/IP runs on | STM32 flash |
+| :--------------------------- | :------------------------------------------------------------ | :------------- | :---------- |
+| `sl_mcu_stm32f407_hosted`    | [ESP-Hosted](https://github.com/espressif/esp-hosted-mcu) (SPI full duplex) | STM32 (lwIP)   | ~66 KB      |
+| `sl_mcu_stm32f407_at`        | [ESP-AT](https://github.com/espressif/esp-at) (SPI half duplex) | ESP          | ~19 KB      |
+
+With ESP-Hosted the ESP is a Wi-Fi network interface: Ethernet frames go over SPI and
+[lwIP](https://savannah.nongnu.org/projects/lwip/) runs on the STM32. With ESP-AT the ESP keeps the
+TCP/IP stack, and the STM32 drives it with AT commands (like an offloaded TCP/IP chip).
+
+The STM32 side runs no RTOS in either example. It is a HAL superloop with small drivers of its own.
 The ESP-Hosted host stack from Espressif needs an RTOS and ESP-IDF APIs, and v3.1.0 has no STM32 port,
 so it is not used on the STM32.
 
 ## Status
 
-Tested with an ESP32-C3 (YD-ESP32-C3) and an STM32F407VET6:
+ESP-Hosted (`sl_mcu_stm32f407_hosted`), tested with an ESP32-C3 (YD-ESP32-C3) and an STM32F407VET6:
 
 - SPI link with the coprocessor reset by the host, and the ESP-Hosted init handshake (RPC v2)
 - RPC: firmware version, MAC, Wi-Fi mode, start, scan, connect, Wi-Fi events
 - lwIP: DHCP with a hostname (`stm32-xxxxxx`, derived from the STM32 unique ID), ARP, ICMP (ping)
 - Ping round trip around 10 ms. The host turns the ESP's Wi-Fi power save off (`WIFI_PS_NONE`),
   which costs extra current on the ESP. With the default modem sleep it's 30 to 230 ms.
+- Link supervision: the host notices a coprocessor restart or a silent coprocessor (probe after 10 s
+  without traffic), resets it through EN and reconnects.
+
+ESP-AT (`sl_mcu_stm32f407_at`), same boards, ESP-AT v5.0.1.0 on the C3:
+
+- SPI link (half duplex, handshake), AT commands, modem sleep off, DHCP hostname, join
+- Ping round trip around 4 to 9 ms (answered by the ESP)
+- TCP echo server on port 7: up to 8000 bytes per round trip echoed back intact, about 1.2 Mbit/s
+  each way
+- Link supervision: an ESP restart (`ready`) or a silent ESP (`AT` probe after 10 s) resets it
+  through EN and rejoins
 
 Known issue: the YD-ESP32-C3 only runs Wi-Fi with a USB cable on one of its ports. Powered from 3.3 V
 on the backplane alone, it boots and completes the host handshake, but its brownout supervisor resets
@@ -28,16 +47,19 @@ The ESP32-S3 coprocessor firmware builds and boots but hasn't been tested with t
 ## Layout
 
 ```text
-coprocessor/                      ESP-IDF project for the ESP32 side (S3 and C3)
+coprocessor/                      ESP-IDF project: ESP-Hosted coprocessor firmware (S3 and C3)
+at_firmware/                      build script and settings for the ESP-AT firmware (C3, SPI)
 esp_hosted/                       submodule: ESP-Hosted v3.1.0 (ESP side only)
-lwip/                             submodule: lwIP STABLE-2_2_1_RELEASE (STM32 side)
+esp_at/                           submodule: ESP-AT v5.0.1.0
+lwip/                             submodule: lwIP STABLE-2_2_1_RELEASE (STM32 side, _hosted only)
 examples/sl_mcu_stm32f407_hosted  STM32CubeIDE project, STM32F407 host (ESP-Hosted, lwIP on the STM32)
-examples/sl_mcu_stm32f407_at      STM32CubeIDE project, STM32F407 host (ESP-AT over SPI, work in progress)
+examples/sl_mcu_stm32f407_at      STM32CubeIDE project, STM32F407 host (ESP-AT over SPI, TCP/IP on the ESP)
 ```
 
 | Submodule    | Used by       | Version                | Upstream                                        |
 | :----------- | :------------ | :--------------------- | :---------------------------------------------- |
 | `esp_hosted` | ESP32 (IDF)   | `v3.1.0`               | https://github.com/espressif/esp-hosted-mcu     |
+| `esp_at`     | ESP32         | `v5.0.1.0`             | https://github.com/espressif/esp-at             |
 | `lwip`       | STM32         | `STABLE-2_2_1_RELEASE` | https://github.com/lwip-tcpip/lwip              |
 
 `esp_hosted` has to be checked out in a directory called `esp_hosted`, because ESP-IDF names a
@@ -55,7 +77,7 @@ For a clone that already exists:
 git submodule update --init --recursive
 ```
 
-## Co-processor firmware (ESP32 side)
+## ESP-Hosted coprocessor firmware (ESP32 side, for `sl_mcu_stm32f407_hosted`)
 
 Needs ESP-IDF v5.5 or later. Built and tested with ESP-IDF `release/v6.2`. After checking out an
 ESP-IDF branch, update its submodules too, or the build fails in mbedtls:
@@ -114,17 +136,46 @@ chip in download mode (`boot:0x0 ... waiting for download`). Press RST and use `
 - Opening the ESP's USB serial port normally resets the chip. Use `idf.py monitor --no-reset` to watch
   it without disturbing the link to the STM32.
 
+## ESP-AT firmware (ESP32 side, for `sl_mcu_stm32f407_at`)
+
+ESP-AT has its own build system and builds against the ESP-IDF version each release pins (`v5.0.1.0`
+pins ESP-IDF `release/v5.4`). Its `build.py` clones that ESP-IDF into `esp_at/esp-idf`, applies
+ESP-AT's patches to it and installs its tools. That checkout is separate from `~/esp/esp-idf`,
+which isn't touched. The first build takes a while (about 1.5 GB of ESP-IDF).
+
+`at_firmware/build.sh` runs it without the interactive questions (platform ESP32C3, module
+ESP32C3-SPI, no silence mode) and adds the settings in `at_firmware/module_cfg/` on top of ESP-AT's
+module defaults. Run it from a shell without ESP-IDF exported (or it unsets it anyway). It skips
+ESP-AT's own `sudo apt-get install`, so the ESP-IDF prerequisites must already be there:
+
+```bash
+sudo apt-get install git wget flex bison gperf python3 python3-pip python3-venv python3-setuptools cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0
+```
+
+```bash
+at_firmware/build.sh
+```
+
+```bash
+at_firmware/build.sh flash /dev/ttyACM0
+```
+
+ESP-AT's SPI pins for the C3 (SCLK 6, MOSI 7, MISO 2, CS 10, handshake 3) are the same as in the
+wiring table below, so the jumpers don't move between the two examples. ESP-AT doesn't use the data
+ready line.
+
 ## STM32 host
 
-`examples/sl_mcu_stm32f407_hosted` is an STM32CubeIDE project for the STM32F407VET6.
+`examples/sl_mcu_stm32f407_hosted` (ESP-Hosted) and `examples/sl_mcu_stm32f407_at` (ESP-AT) are
+STM32CubeIDE projects for the STM32F407VET6. Both use the same pins.
 
 ### Building
 
 Open the `examples` folder as the workspace in STM32CubeIDE (tested with 2.2.0) and build
-`sl_mcu_stm32f407_hosted`. lwIP comes into the project through a symlink, `lwip -> ../../lwip/src`,
-so the submodules must be checked out.
+`sl_mcu_stm32f407_hosted` or `sl_mcu_stm32f407_at`. In `_hosted`, lwIP comes into the project through
+a symlink, `lwip -> ../../lwip/src`, so the submodules must be checked out.
 
-The Wi-Fi credentials are not in git. Create `Core/Inc/wifi_secrets.h`:
+The Wi-Fi credentials are not in git. Create `Core/Inc/wifi_secrets.h` in each project:
 
 ```c
 #ifndef WIFI_SECRETS_H_
@@ -150,7 +201,7 @@ openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "program examples/sl_m
 
 The log goes to USART1 (PA9/PA10) at 921600 baud.
 
-### Code
+### Code: `sl_mcu_stm32f407_hosted`
 
 | File                | What it does                                                                 |
 | :------------------ | :--------------------------------------------------------------------------- |
@@ -166,9 +217,21 @@ The RPC messages are encoded by hand from `esp_hosted/common/serializers/eh_prot
 instead of using the generated protobuf-c code, which is over 200 KB of flash. The whole STM32 image
 is around 66 KB of flash.
 
+### Code: `sl_mcu_stm32f407_at`
+
+| File                | What it does                                                                 |
+| :------------------ | :--------------------------------------------------------------------------- |
+| `at_spi.c`          | ESP-AT SPI transport (half duplex, handshake), byte streams both ways        |
+| `at_client.c`       | AT commands and responses, unsolicited lines, `+IPD` socket data, `CIPSEND`  |
+| `wifi_at.c`         | Station (hostname, join, IP), TCP echo server on port 7, link supervision    |
+
+The protocol follows ESP-AT's reference SPI master, `esp_at/examples/at_spi_master`. The whole STM32
+image is around 19 KB of flash.
+
 ### Wiring
 
-SPI1 on the STM32, SPI full duplex mode 3 at 10.5 MHz. The host resets the coprocessor through its EN pin.
+SPI1 on the STM32 at 10.5 MHz: mode 3 full duplex for ESP-Hosted, mode 0 half duplex for ESP-AT
+(the `.ioc` of each project has its mode). The host resets the ESP through its EN pin.
 
 | Signal     | STM32F407        | ESP32-C3 | ESP32-S3 | Direction    |
 | :--------- | :--------------: | :------: | :------: | :----------- |
@@ -177,7 +240,7 @@ SPI1 on the STM32, SPI full duplex mode 3 at 10.5 MHz. The host resets the copro
 | MISO       | PA6              | GPIO2    | GPIO13   | ESP → host   |
 | CS         | PA4              | GPIO10   | GPIO10   | host → ESP   |
 | Handshake  | PC4              | GPIO3    | GPIO17   | ESP → host   |
-| Data ready | PC5              | GPIO4    | GPIO4    | ESP → host   |
+| Data ready | PC5              | GPIO4    | GPIO4    | ESP → host (ESP-Hosted only) |
 | Reset      | PA3 (open drain) | EN (RST) | EN (RST) | host → ESP   |
 | GND        | GND              | GND      | GND      |              |
 

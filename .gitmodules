@@ -4,3 +4,7 @@
 [submodule "lwip"]
 	path = lwip
 	url = https://github.com/lwip-tcpip/lwip.git
+[submodule "esp_at"]
+	path = esp_at
+	url = https://github.com/espressif/esp-at.git
+	ignore = dirty

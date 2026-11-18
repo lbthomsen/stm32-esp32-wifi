@@ -22,11 +22,10 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
-#include "esp_host.h"
-#include "esp_rpc.h"
-#include "wifi_sta.h"
+#include "at_spi.h"
+#include "at_client.h"
+#include "wifi_at.h"
 #include "wifi_secrets.h"
-#include "wifi_netif.h"
 
 /* USER CODE END Includes */
 
@@ -114,10 +113,8 @@ int main(void)
 
     printf("\n\n\nStarting Wi-Fi (ESP-AT)\n");
 
-    esp_rpc_init(wifi_sta_rpc_event);
-    wifi_sta_init(WIFI_SSID, WIFI_PASSWORD);
-    wifi_netif_init();
-    esp_host_init(&hspi1);
+    wifi_at_init(WIFI_SSID, WIFI_PASSWORD);
+    at_spi_init(&hspi1);
 
   /* USER CODE END 2 */
 
@@ -136,18 +133,17 @@ int main(void)
         }
 
         if (now >= next_status) {
-            const esp_spi_stats_t *st = esp_spi_get_stats();
-            uint32_t ip = wifi_netif_get_ip();
-            printf("status: up %lu s, ip %lu.%lu.%lu.%lu, spi xfer %lu tx %lu rx %lu, errors %lu/%lu/%lu\n",
-                    now / 1000, ip & 0xff, (ip >> 8) & 0xff, (ip >> 16) & 0xff, ip >> 24,
-                    st->transactions, st->tx_frames, st->rx_frames,
-                    st->rx_bad_checksum, st->rx_bad_header, st->spi_errors);
+            const at_spi_stats_t *st = at_spi_get_stats();
+            printf("status: up %lu s, %s ip %s, state %d, spi xfer %lu tx %lu rx %lu, errors seq %lu len %lu spi %lu ovf %lu\n",
+                    now / 1000, wifi_at_get_hostname(), wifi_at_get_ip(), wifi_at_get_state(),
+                    st->transactions, st->tx_bytes, st->rx_bytes,
+                    st->seq_errors, st->len_errors, st->spi_errors, st->rx_overflows);
             next_status = now + 30000;
         }
 
-        esp_host_poll();
-        wifi_sta_poll();
-        wifi_netif_poll();
+        at_spi_poll();
+        at_client_poll();
+        wifi_at_poll();
 
     /* USER CODE END WHILE */
 
@@ -221,8 +217,8 @@ static void MX_SPI1_Init(void)
   hspi1.Init.Mode = SPI_MODE_MASTER;
   hspi1.Init.Direction = SPI_DIRECTION_2LINES;
   hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
-  hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
   hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
