@@ -51,6 +51,14 @@ void esp_rpc_init(esp_rpc_event_cb_t event_cb) {
     req_msg_id = 0;
 }
 
+void esp_rpc_reset(void) {
+    rx_len = 0;
+    rx_overflow = 0;
+    tx_pending = 0;
+    req_callback = NULL;
+    req_msg_id = 0;
+}
+
 int esp_rpc_busy(void) {
     return req_msg_id != 0;
 }

@@ -30,4 +30,10 @@ void esp_host_set_sta_rx(esp_host_data_rx_cb_t cb);   // Ethernet frames from th
 void esp_host_poll(void);
 const esp_host_info_t* esp_host_get_info(void);
 
+// HAL tick of the last frame received from the coprocessor (any interface)
+uint32_t esp_host_last_rx(void);
+
+// Reset the coprocessor through its EN pin and wait for a fresh init event
+void esp_host_restart_cp(void);
+
 #endif /* ESP_HOST_H_ */

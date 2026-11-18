@@ -11,6 +11,7 @@
 #include "main.h"
 #include "wifi_sta.h"
 #include "esp_rpc.h"
+#include "esp_host.h"
 #include "pb.h"
 
 #define WIFI_MODE_STA           1
@@ -19,6 +20,7 @@
 #define SCAN_MAX_RECORDS        16
 #define RETRY_DELAY_MS          5000
 #define NOT_INIT_RETRY_MS       500
+#define LIVENESS_IDLE_MS        10000   // probe the coprocessor after this long without traffic
 #define ESP_ERR_WIFI_NOT_INIT   0x3001  // CP announced itself before its app_main ran esp_wifi_init()
 
 /* wifi_event_t values (IDF esp_wifi_types.h) for Event_WifiEventNoArgs */
@@ -49,9 +51,21 @@ static uint32_t retry_tick;
 static uint32_t retry_delay;
 static wifi_sta_state_t retry_state;
 static uint8_t req_in_flight;
+static uint32_t last_probe_tick;
 
 static void set_state(wifi_sta_state_t s) {
     state = s;
+}
+
+/* Coprocessor gone (request timed out) or restarted: reset it through EN and
+ * start over. The netif follows the state, so the link goes down and DHCP
+ * runs again once Wi-Fi is back. */
+static void restart_cp(void) {
+    req_in_flight = 0;
+    cp_up = 0;
+    scan_done = 0;
+    esp_host_restart_cp();
+    set_state(WIFI_STA_WAIT_CP);
 }
 
 static void retry_later(wifi_sta_state_t s, uint32_t delay_ms) {
@@ -78,7 +92,7 @@ static void on_simple_resp(esp_rpc_status_t status, uint16_t msg_id, const uint8
     req_in_flight = 0;
     if (status != ESP_RPC_OK) {
         printf("wifi_sta: request failed (status %d) in state %d\n", status, state);
-        set_state(WIFI_STA_ERROR);
+        restart_cp();
         return;
     }
     int32_t resp = resp_code(body, len, 1);
@@ -122,7 +136,8 @@ static void on_fw_version(esp_rpc_status_t status, uint16_t msg_id, const uint8_
     (void) msg_id;
     req_in_flight = 0;
     if (status != ESP_RPC_OK) {
-        set_state(WIFI_STA_ERROR);
+        printf("wifi_sta: request 0x%03x failed (status %d)\n", msg_id, status);
+        restart_cp();
         return;
     }
     uint32_t v[5] = { 0 };
@@ -145,7 +160,8 @@ static void on_mac(esp_rpc_status_t status, uint16_t msg_id, const uint8_t *body
     (void) msg_id;
     req_in_flight = 0;
     if (status != ESP_RPC_OK) {
-        set_state(WIFI_STA_ERROR);
+        printf("wifi_sta: request 0x%03x failed (status %d)\n", msg_id, status);
+        restart_cp();
         return;
     }
     pb_reader_t r;
@@ -197,7 +213,8 @@ static void on_ap_records(esp_rpc_status_t status, uint16_t msg_id, const uint8_
     (void) msg_id;
     req_in_flight = 0;
     if (status != ESP_RPC_OK) {
-        set_state(WIFI_STA_ERROR);
+        printf("wifi_sta: request 0x%03x failed (status %d)\n", msg_id, status);
+        restart_cp();
         return;
     }
     int32_t number = 0;
@@ -215,6 +232,17 @@ static void on_ap_records(esp_rpc_status_t status, uint16_t msg_id, const uint8_
     set_state(WIFI_STA_SET_CONFIG);
 }
 
+static void on_probe(esp_rpc_status_t status, uint16_t msg_id, const uint8_t *body, size_t len) {
+    (void) msg_id;
+    (void) body;
+    (void) len;
+    req_in_flight = 0;
+    if (status != ESP_RPC_OK) {
+        printf("wifi_sta: coprocessor not responding\n");
+        restart_cp();
+    }
+}
+
 static void send(uint16_t msg_id, const uint8_t *body, size_t len, esp_rpc_resp_cb_t cb) {
     if (esp_rpc_request(msg_id, body, len, cb) == 0) {
         req_in_flight = 1;
@@ -229,6 +257,12 @@ void wifi_sta_rpc_event(uint16_t msg_id, const uint8_t *body, size_t len) {
     case RPC_EVENT_ESP_INIT:
         printf("wifi_sta: coprocessor RPC ready\n");
         cp_up = 1;
+        if (state != WIFI_STA_WAIT_CP) {
+            // It restarted under us: run the whole sequence again.
+            req_in_flight = 0;
+            scan_done = 0;
+            set_state(WIFI_STA_GET_FW);
+        }
         break;
 
     case RPC_EVENT_WIFI_NO_ARGS: {
@@ -307,6 +341,15 @@ void wifi_sta_poll(void) {
 
     uint8_t buf[128];
     pb_writer_t w;
+
+    // Liveness: a quiet link might be a dead coprocessor. Ask it something cheap.
+    uint32_t now = HAL_GetTick();
+    if (state != WIFI_STA_WAIT_CP && state != WIFI_STA_ERROR
+            && now - esp_host_last_rx() > LIVENESS_IDLE_MS && now - last_probe_tick > LIVENESS_IDLE_MS) {
+        last_probe_tick = now;
+        send(RPC_ID_GET_CP_FW_VERSION, NULL, 0, on_probe);
+        return;
+    }
 
     switch (state) {
     case WIFI_STA_WAIT_CP:

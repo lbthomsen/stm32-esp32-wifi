@@ -53,6 +53,7 @@ static uint32_t init_wait_start;
 #define ESP_HOST_WAKE_AFTER_MS 2000
 
 static uint8_t wake_sent;
+static uint32_t last_rx_tick;
 
 static uint32_t tlv_u32(const uint8_t *v, uint8_t len) {
     uint32_t r = 0;
@@ -63,6 +64,12 @@ static uint32_t tlv_u32(const uint8_t *v, uint8_t len) {
 }
 
 static void handle_init_event(const uint8_t *tlv, uint16_t len) {
+    if (info.ready) {
+        // The coprocessor restarted on its own (crash, watchdog, brownout).
+        // Anything in flight went with it.
+        printf("esp_host: coprocessor restarted\n");
+        esp_rpc_reset();
+    }
     memset(&info, 0, sizeof(info));
 
     while (len >= 2) {
@@ -162,6 +169,8 @@ static void send_wake(void) {
 }
 
 static void host_rx(const esp_frame_t *frame) {
+    last_rx_tick = HAL_GetTick();
+
     if (frame->if_type == ESP_IF_PRIV && frame->len >= 2 && frame->payload[0] == PRIV_EVENT_INIT) {
         uint8_t evt_len = frame->payload[1];
         if (evt_len + 2u <= frame->len) {
@@ -187,13 +196,8 @@ static void host_rx(const esp_frame_t *frame) {
 }
 
 void esp_host_init(SPI_HandleTypeDef *hspi) {
-    memset(&info, 0, sizeof(info));
-    init_reply_pending = 0;
     esp_spi_init(hspi, host_rx);
-    printf("esp_host: resetting coprocessor\n");
-    esp_spi_reset_cp();
-    wake_sent = 0;
-    init_wait_start = HAL_GetTick();
+    esp_host_restart_cp();
 }
 
 void esp_host_poll(void) {
@@ -227,6 +231,20 @@ void esp_host_poll(void) {
             printf("esp_host: init reply queued\n");
         }
     }
+}
+
+void esp_host_restart_cp(void) {
+    printf("esp_host: resetting coprocessor\n");
+    memset(&info, 0, sizeof(info));
+    init_reply_pending = 0;
+    esp_rpc_reset();
+    esp_spi_reset_cp();
+    wake_sent = 0;
+    init_wait_start = HAL_GetTick();
+}
+
+uint32_t esp_host_last_rx(void) {
+    return last_rx_tick;
 }
 
 void esp_host_set_sta_rx(esp_host_data_rx_cb_t cb) {

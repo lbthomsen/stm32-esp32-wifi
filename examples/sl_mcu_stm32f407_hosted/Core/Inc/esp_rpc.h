@@ -59,4 +59,7 @@ void esp_rpc_rx(const esp_frame_t *frame);
 int esp_rpc_request(uint16_t msg_id, const uint8_t *body, size_t len, esp_rpc_resp_cb_t cb);
 int esp_rpc_busy(void);
 
+// Drop any outstanding request (no callback) and partial frames, e.g. after a coprocessor reset.
+void esp_rpc_reset(void);
+
 #endif /* ESP_RPC_H_ */
