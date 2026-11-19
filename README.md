@@ -175,6 +175,48 @@ ESP-AT's SPI pins for the C3 (SCLK 6, MOSI 7, MISO 2, CS 10, handshake 3) are th
 wiring table below, so the jumpers don't move between the two examples. ESP-AT doesn't use the data
 ready line.
 
+## Switching between the examples
+
+The wiring is the same for both, so switching is just flashing both chips. The ESP and the STM32
+firmware have to match: ESP-Hosted on the C3 with `sl_mcu_stm32f407_hosted`, ESP-AT with
+`sl_mcu_stm32f407_at`.
+
+1. Halt the STM32 first. A running host resets the ESP through EN when the link goes quiet, and
+   that reset can land in the middle of the ESP flash.
+
+   ```bash
+   openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "init; halt; exit"
+   ```
+
+2. Flash the ESP. An erase first is optional (it clears ESP-AT's or ESP-Hosted's stored settings);
+   both ways were tested.
+
+   To ESP-AT:
+
+   ```bash
+   at_firmware/build.sh flash /dev/ttyACM1
+   ```
+
+   To ESP-Hosted:
+
+   ```bash
+   cd coprocessor && idf.py -B build_esp32c3 -D SDKCONFIG=sdkconfig.esp32c3 -p /dev/ttyACM1 flash
+   ```
+
+3. Flash and start the matching STM32 example. It resets the ESP through EN and brings the link up.
+
+   ```bash
+   openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "program examples/sl_mcu_stm32f407_at/Debug/sl_mcu_stm32f407_at.elf verify reset exit"
+   ```
+
+   ```bash
+   openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "program examples/sl_mcu_stm32f407_hosted/Debug/sl_mcu_stm32f407_hosted.elf verify reset exit"
+   ```
+
+Tested on 2026-11-19: ESP-Hosted to ESP-AT and back, with and without an erase. Each time the
+link came up on the first try (0 SPI errors, ping and the status page answered, NIST time synced).
+The ESP port number can change after a flash; `/dev/serial/by-id/` has stable names.
+
 ## ESP boot log
 
 The ESP logs to two places at 115200 baud: UART0 (C3: TX GPIO21, RX GPIO20; S3: TX GPIO43, RX
