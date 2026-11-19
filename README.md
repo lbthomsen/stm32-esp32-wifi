@@ -175,6 +175,37 @@ ESP-AT's SPI pins for the C3 (SCLK 6, MOSI 7, MISO 2, CS 10, handshake 3) are th
 wiring table below, so the jumpers don't move between the two examples. ESP-AT doesn't use the data
 ready line.
 
+## Prebuilt ESP32-C3 firmware
+
+`firmware/` has both C3 firmwares as single images, so the ESP side can be flashed without building
+anything (only `esptool.py`, e.g. `pip install esptool`). Each image starts at offset 0 and contains
+the bootloader, partition table and application:
+
+| File                              | Firmware                                   | For                       |
+| :-------------------------------- | :----------------------------------------- | :------------------------ |
+| `firmware/esp32c3_esp_hosted.bin` | ESP-Hosted v3.1.0 coprocessor (`coprocessor/`, ESP-IDF v6.2) | `sl_mcu_stm32f407_hosted` |
+| `firmware/esp32c3_esp_at.bin`     | ESP-AT v5.0.1.0, ESP32C3-SPI with `at_firmware/module_cfg` | `sl_mcu_stm32f407_at`     |
+
+Both use the pins in the wiring table and a 4 MB flash.
+
+```bash
+esptool.py --chip esp32c3 -p /dev/ttyACM1 write-flash 0x0 firmware/esp32c3_esp_hosted.bin
+```
+
+```bash
+esptool.py --chip esp32c3 -p /dev/ttyACM1 write-flash 0x0 firmware/esp32c3_esp_at.bin
+```
+
+They were made from the builds above with:
+
+```bash
+cd coprocessor/build_esp32c3 && esptool.py --chip esp32c3 merge-bin -o ../../firmware/esp32c3_esp_hosted.bin @flash_args
+```
+
+```bash
+cp esp_at/build/factory/factory_ESP32C3-SPI_unfilled.bin firmware/esp32c3_esp_at.bin
+```
+
 ## Switching between the examples
 
 The wiring is the same for both, so switching is just flashing both chips. The ESP and the STM32
