@@ -31,13 +31,16 @@ typedef void (*at_done_cb_t)(at_result_t result);
 typedef void (*at_urc_cb_t)(const char *line);
 typedef void (*at_ipd_cb_t)(int link, const uint8_t *data, size_t len);
 
+// urc_cb gets unsolicited lines, ipd_cb socket data.
 void at_client_init(at_urc_cb_t urc_cb, at_ipd_cb_t ipd_cb);
 
 // Forget any command in progress and partial input (after resetting the ESP).
 void at_client_reset(void);
 
+// Main loop: parse what at_spi received, time out the command in progress.
 void at_client_poll(void);
 
+// 1 while a command is in progress (only one at a time).
 int at_client_busy(void);
 
 // Send "cmd\r\n". Returns 0 if accepted, -1 if busy, -2 if it doesn't fit.
@@ -49,6 +52,7 @@ int at_client_send(int link, const uint8_t *data, size_t len, uint32_t timeout_m
 // HAL tick of the last byte received from the ESP
 uint32_t at_client_last_rx(void);
 
+// Result as text, for logs.
 const char* at_result_name(at_result_t r);
 
 #endif /* AT_CLIENT_H_ */

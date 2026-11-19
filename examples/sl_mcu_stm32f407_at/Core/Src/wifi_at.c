@@ -1,5 +1,25 @@
 /*
  * wifi_at.c - Wi-Fi station and TCP links through ESP-AT (no RTOS).
+ *
+ * Bring-up is a state machine, one AT command at a time: wifi_at_poll()
+ * sends the command for the current state, on_step_done() moves on:
+ *   WAIT_READY ("ready" from the ESP) -> ECHO_OFF (ATE0) -> MODE
+ *   (AT+CWMODE=1) -> SLEEP_OFF (AT+SLEEP=0) -> HOSTNAME -> JOIN (AT+CWJAP)
+ *   -> GET_IP (AT+CIPSTA?) -> MUX (AT+CIPMUX=1) -> SERVER_MAX_CONN_SET ->
+ *   SERVER (AT+CIPSERVER=1,<port>) -> RUNNING
+ * In RUNNING the services (HTTP server, daytime client) use the links and
+ * wifi_at asks for the RSSI every 30 s.
+ *
+ * Links: ESP-AT has link IDs 0..4. links[] records which service owns
+ * each; "<link>,CONNECT", "+IPD" data and "<link>,CLOSED" are passed to the
+ * owner's handler. Incoming connections belong to the server's handler,
+ * outgoing ones to whoever called wifi_at_connect().
+ *
+ * Supervision: no "ready" after a reset, a command that times out, or a
+ * silent ESP (no byte for LIVENESS_IDLE_MS, then an "AT" probe that fails)
+ * resets the ESP through EN. A "ready" while running means the ESP restarted
+ * on its own; the sequence starts over. Wi-Fi loss is left to ESP-AT's own
+ * reconnect (WAIT_IP) for up to a minute.
  */
 
 #include <stdio.h>
@@ -19,17 +39,17 @@
 #define RSSI_PERIOD_MS      30000
 
 static wifi_at_state_t state;
-static const char *sta_ssid;
+static const char *sta_ssid;            // credentials from wifi_secrets.h
 static const char *sta_password;
 static char hostname[16];
-static char ip[16];
-static int rssi;
-static uint32_t state_tick;
+static char ip[16];                     // dotted quad from AT+CIPSTA?
+static int rssi;                        // dBm from AT+CWJAP?
+static uint32_t state_tick;             // when the current state began
 static uint32_t last_probe_tick;
 static uint32_t last_rssi_tick;
-static uint8_t ready_seen;
-static uint8_t got_ip;
-static uint8_t server_up;
+static uint8_t ready_seen;              // "ready" since the last reset
+static uint8_t got_ip;                  // "WIFI GOT IP" since the last disconnect
+static uint8_t server_up;               // AT+CIPSERVER done since the last ESP start
 
 static uint16_t server_port;
 static const wifi_at_link_handler_t *server_handler;
@@ -40,6 +60,7 @@ static uint8_t link_connected[WIFI_AT_MAX_LINKS];
 static int connecting_link = -1;    // link of the AT+CIPSTART in progress
 static at_done_cb_t connect_done_cb;
 
+// Change state and note when (for the timeouts).
 static void set_state(wifi_at_state_t s) {
     state = s;
     state_tick = HAL_GetTick();
@@ -53,6 +74,7 @@ static void make_hostname(void) {
     snprintf(hostname, sizeof(hostname), "stm32-%06lx", id & 0xffffff);
 }
 
+// Free a link; its owner hears about it if it was connected.
 static void release_link(int link) {
     const wifi_at_link_handler_t *h = links[link];
     uint8_t was_connected = link_connected[link];
@@ -79,6 +101,7 @@ static void release_all_links(void) {
     }
 }
 
+// Reset the ESP through EN and start the bring-up over.
 static void restart_esp(const char *why) {
     printf("wifi_at: %s - resetting the ESP\n", why);
     at_spi_reset_esp();
@@ -93,6 +116,7 @@ static void restart_esp(const char *why) {
 }
 
 // "<link>,CONNECT" / "<link>,CLOSED" / "<link>,CONNECT FAIL"
+// Returns 1 if the line was a link event (and handles it).
 static int link_urc(const char *line) {
     if (!(line[0] >= '0' && line[0] < '0' + WIFI_AT_MAX_LINKS && line[1] == ',')) {
         return 0;
@@ -116,6 +140,7 @@ static int link_urc(const char *line) {
     return 1;
 }
 
+// Unsolicited lines from the ESP (registered with at_client_init()).
 static void on_urc(const char *line) {
     if (link_urc(line)) {
         return;
@@ -149,12 +174,14 @@ static void on_urc(const char *line) {
     printf("wifi_at: < %s\n", line);
 }
 
+// Socket data: to the link's owner.
 static void on_ipd(int link, const uint8_t *data, size_t len) {
     if (link >= 0 && link < WIFI_AT_MAX_LINKS && links[link] && links[link]->on_data) {
         links[link]->on_data(link, data, len);
     }
 }
 
+// Response line of AT+CIPSTA?: pick out the IP address.
 static void on_ip_line(const char *line) {
     // +CIPSTA:ip:"10.1.128.120"
     const char *p = strstr(line, "+CIPSTA:ip:\"");
@@ -169,6 +196,7 @@ static void on_ip_line(const char *line) {
     }
 }
 
+// Response line of AT+CWJAP?: the RSSI is the fourth field.
 static void on_cwjap_line(const char *line) {
     // +CWJAP:"stm32","66:66:b3:7b:a1:4f",9,-49,0,1,3,0,1
     if (strncmp(line, "+CWJAP:", 7) != 0) {
@@ -189,6 +217,7 @@ static void on_cwjap_line(const char *line) {
     }
 }
 
+// A bring-up command finished: move to the next state (or retry).
 static void on_step_done(at_result_t r) {
     switch (state) {
     case WIFI_AT_ECHO_OFF:
@@ -236,18 +265,22 @@ static void on_step_done(at_result_t r) {
     }
 }
 
+// Liveness probe ("AT") answered, or not.
 static void on_probe_done(at_result_t r) {
     if (r != AT_OK) {
         restart_esp("ESP not responding");
     }
 }
 
+// AT+CWJAP? finished (the RSSI was taken from its response line).
 static void on_rssi_done(at_result_t r) {
     if (r == AT_TIMEOUT) {
         restart_esp("ESP not responding");
     }
 }
 
+// AT+CIPSTART finished: release the link if it never connected, then tell
+// the service.
 static void on_connect_done(at_result_t r) {
     int link = connecting_link;
     at_done_cb_t cb = connect_done_cb;
@@ -315,6 +348,7 @@ void wifi_at_init(const char *ssid, const char *password, uint16_t port,
     set_state(WIFI_AT_WAIT_READY);
 }
 
+// Main loop: liveness check, then the command for the current state.
 void wifi_at_poll(void) {
     char cmd[128];
     uint32_t now = HAL_GetTick();

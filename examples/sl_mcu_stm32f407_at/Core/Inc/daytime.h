@@ -29,6 +29,7 @@ typedef struct {
     int32_t last_drift_s;       // NIST minus our clock at the last sync (0 on the first)
 } daytime_stats_t;
 
+// Main loop: starts a query when one is due, handles timeouts.
 void daytime_poll(void);
 
 // Current UTC time as Unix seconds. Returns 0 if not synced yet.
@@ -37,6 +38,7 @@ int daytime_now(uint32_t *unix_s);
 // "YYYY-MM-DD HH:MM:SS" (needs 20 bytes)
 void daytime_format(uint32_t unix_s, char *buf, size_t size);
 
+// Sync counters for the status page.
 const daytime_stats_t* daytime_get_stats(void);
 
 #endif /* DAYTIME_H_ */

@@ -1,5 +1,10 @@
 /*
- * daytime.c - UTC time from NIST's daytime service (no RTOS).
+ * daytime.c - UTC time from NIST's daytime service over ESP-AT (no RTOS).
+ *
+ * Every DAYTIME_PERIOD_MS: wifi_at_connect() opens a TCP link to
+ * time.nist.gov:13 (ESP-AT resolves the name), the server sends its one
+ * line and closes, and the CLOSED event triggers parsing. daytime_poll()
+ * starts each query and handles the receive timeout.
  */
 
 #include <stdio.h>
@@ -50,6 +55,7 @@ static int32_t days_from_civil(int32_t y, uint32_t m, uint32_t d) {
     return era * 146097 + (int32_t) doe - 719468;
 }
 
+// The inverse: date from days since 1970-01-01.
 static void civil_from_days(int32_t z, int32_t *y, uint32_t *m, uint32_t *d) {
     z += 719468;
     int32_t era = (z >= 0 ? z : z - 146096) / 146097;
@@ -62,6 +68,7 @@ static void civil_from_days(int32_t z, int32_t *y, uint32_t *m, uint32_t *d) {
     *y = (int32_t) yoe + era * 400 + (*m <= 2);
 }
 
+// Unix seconds as "YYYY-MM-DD HH:MM:SS" (UTC, no leap seconds, like Unix time).
 void daytime_format(uint32_t unix_s, char *buf, size_t size) {
     int32_t y;
     uint32_t m, d;
@@ -72,6 +79,8 @@ void daytime_format(uint32_t unix_s, char *buf, size_t size) {
             (unsigned long) (secs % 60));
 }
 
+// NIST time at the last sync plus the ticks since then. The HSE crystal
+// keeps this within a second or so over the 10 minutes between syncs.
 int daytime_now(uint32_t *unix_s) {
     if (!synced) {
         return 0;
@@ -84,11 +93,13 @@ const daytime_stats_t* daytime_get_stats(void) {
     return &stats;
 }
 
+// Change state and note when (for the timeouts).
 static void set_state(dt_state_t s) {
     state = s;
     state_tick = HAL_GetTick();
 }
 
+// A query failed: log it and try again after DAYTIME_RETRY_MS.
 static void failed(const char *why) {
     printf("daytime: %s\n", why);
     stats.failures++;
@@ -98,6 +109,8 @@ static void failed(const char *why) {
 }
 
 // "\n61362 26-11-18 08:34:08 00 0 0 310.3 UTC(NIST) *\n"
+// Parse the collected reply into Unix seconds. Checks the "UTC(NIST)" label,
+// the field ranges, and that the date agrees with the MJD in front of it.
 static int parse_reply(uint32_t *unix_s) {
     long mjd;
     int yy, mo, dd, hh, mi, ss;
@@ -120,6 +133,7 @@ static int parse_reply(uint32_t *unix_s) {
     return 1;
 }
 
+// The server has closed: use the reply, schedule the next query.
 static void finish_reply(void) {
     uint32_t t;
     if (!parse_reply(&t)) {
@@ -150,11 +164,13 @@ static void finish_reply(void) {
     set_state(DT_IDLE);
 }
 
+// wifi_at: connected.
 static void on_connect(int l) {
     (void) l;
     reply_len = 0;
 }
 
+// wifi_at: data from the server; collect it.
 static void on_data(int l, const uint8_t *data, size_t len) {
     (void) l;
     for (size_t i = 0; i < len && reply_len < sizeof(reply) - 1; ++i) {
@@ -162,6 +178,7 @@ static void on_data(int l, const uint8_t *data, size_t len) {
     }
 }
 
+// wifi_at: the link closed.
 static void on_closed(int l) {
     (void) l;
     // The server hangs up after the line: that's the normal end
@@ -170,6 +187,7 @@ static void on_closed(int l) {
     }
 }
 
+// AT+CIPSTART finished.
 static void on_connect_done(at_result_t r) {
     if (state != DT_CONNECTING) {
         return;     // already closed and handled
@@ -183,6 +201,7 @@ static void on_connect_done(at_result_t r) {
     }
 }
 
+// AT+CIPCLOSE (after a receive timeout) finished.
 static void on_close_done(at_result_t r) {
     (void) r;
     // The CLOSED event finishes it; if that got lost, don't hang
@@ -191,6 +210,8 @@ static void on_close_done(at_result_t r) {
     }
 }
 
+// Main loop: start a query when one is due and Wi-Fi is running; time out
+// a reply that doesn't come.
 void daytime_poll(void) {
     uint32_t now = HAL_GetTick();
 

@@ -17,10 +17,13 @@
 
 #define HTTP_SERVER_PORT 80
 
+// Pass this to wifi_at_init(): wifi_at hands it every incoming connection.
 extern const wifi_at_link_handler_t http_server_handler;
 
+// Main loop: sends replies and closes links (one AT command per call).
 void http_server_poll(void);
 
+// Requests answered since start-up.
 uint32_t http_server_requests(void);
 
 #endif /* HTTP_SERVER_H_ */

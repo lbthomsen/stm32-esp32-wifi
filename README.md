@@ -1,11 +1,12 @@
 # stm32-esp32-wifi
 
 Use an ESP32 as a Wi-Fi co-processor for an STM32 host, over SPI. There are two examples, one for
-each way of splitting the work:
+each way of splitting the work. Both do the same job: join a network, serve a status page on port 80
+and keep UTC time from NIST's daytime service.
 
 | Example                      | ESP firmware                                                  | TCP/IP runs on | STM32 flash |
 | :--------------------------- | :------------------------------------------------------------ | :------------- | :---------- |
-| `sl_mcu_stm32f407_hosted`    | [ESP-Hosted](https://github.com/espressif/esp-hosted-mcu) (SPI full duplex) | STM32 (lwIP)   | ~66 KB      |
+| `sl_mcu_stm32f407_hosted`    | [ESP-Hosted](https://github.com/espressif/esp-hosted-mcu) (SPI full duplex) | STM32 (lwIP)   | ~83 KB      |
 | `sl_mcu_stm32f407_at`        | [ESP-AT](https://github.com/espressif/esp-at) (SPI half duplex) | ESP          | ~28 KB      |
 
 With ESP-Hosted the ESP is a Wi-Fi network interface: Ethernet frames go over SPI and
@@ -23,8 +24,13 @@ ESP-Hosted (`sl_mcu_stm32f407_hosted`), tested with an ESP32-C3 (YD-ESP32-C3) an
 - SPI link with the coprocessor reset by the host, and the ESP-Hosted init handshake (RPC v2)
 - RPC: firmware version, MAC, Wi-Fi mode, start, scan, connect, Wi-Fi events
 - lwIP: DHCP with a hostname (`stm32-xxxxxx`, derived from the STM32 unique ID), ARP, ICMP (ping)
-- Ping round trip around 10 ms. The host turns the ESP's Wi-Fi power save off (`WIFI_PS_NONE`),
+- Interrupt-driven SPI: handshake/data ready interrupts, a settle timer and SPI DMA completions run
+  every transfer; received frames are queued and handed to RPC and lwIP in the main loop
+- Ping round trip around 7 to 10 ms. The host turns the ESP's Wi-Fi power save off (`WIFI_PS_NONE`),
   which costs extra current on the ESP. With the default modem sleep it's 30 to 230 ms.
+- Web server on port 80 (lwIP raw TCP API): `GET /` returns the same status page as the ESP-AT
+  example. Eight simultaneous requests are all answered at once.
+- UTC time from NIST's daytime service (lwIP DNS and TCP) at start-up and every 10 minutes
 - Link supervision: the host notices a coprocessor restart or a silent coprocessor (probe after 10 s
   without traffic), resets it through EN and reconnects.
 
@@ -113,7 +119,8 @@ idf.py -B build_esp32c3 -D SDKCONFIG=sdkconfig.esp32c3 set-target esp32c3
 idf.py -B build_esp32c3 -D SDKCONFIG=sdkconfig.esp32c3 -p /dev/ttyACM1 build flash monitor
 ```
 
-A board that previously ran other firmware (e.g. ESP-AT) should be erased first:
+A board that previously ran other firmware (e.g. ESP-AT) can be erased first, so no old settings
+(NVS, OTA data) are left behind:
 
 ```bash
 idf.py -B build_esp32c3 -D SDKCONFIG=sdkconfig.esp32c3 -p /dev/ttyACM1 erase-flash
@@ -342,17 +349,35 @@ The log goes to USART1 (PA9/PA10) at 921600 baud.
 
 | File                | What it does                                                                 |
 | :------------------ | :--------------------------------------------------------------------------- |
-| `esp_spi.c`         | SPI transport: CS/handshake/data ready, framing, checksum, TX queue, reset   |
+| `esp_spi.c`         | SPI transport, interrupt driven: handshake/data ready, framing, checksum, TX and RX queues, reset |
 | `esp_host.c`        | Init event and host capability reply, routes frames to RPC and network       |
 | `esp_rpc.c`         | RPC control path: endpoint/data TLVs, `Rpc` envelope, requests and events    |
 | `pb.c`              | Minimal protobuf encoder/decoder (no malloc)                                 |
-| `wifi_sta.c`        | Station state machine: mode, start, scan, connect, reconnect                 |
+| `wifi_sta.c`        | Station state machine: mode, start, scan, connect, reconnect, RSSI           |
 | `wifi_netif.c`      | lwIP netif on the STA data path, DHCP, hostname                              |
+| `http_server.c`     | HTTP/1.0 status page on port 80 (lwIP raw TCP API)                           |
+| `daytime.c`         | NIST daytime client (lwIP DNS and TCP), UTC clock between syncs              |
 | `lwipopts.h`        | lwIP configuration (`NO_SYS`)                                                |
 
 The RPC messages are encoded by hand from `esp_hosted/common/serializers/eh_proto_v2/src/proto/rpc_v2.proto`
 instead of using the generated protobuf-c code, which is over 200 KB of flash. The whole STM32 image
-is around 66 KB of flash.
+is around 83 KB of flash.
+
+How the work is split:
+
+- **Interrupts** run the SPI link. Every transaction is a full duplex DMA transfer of 1600 bytes. A
+  rising edge on handshake (EXTI4) or data ready (EXTI9_5) starts one. The C3 raises handshake a
+  little before its SPI slave is ready (more than 50 µs, less than 200 µs), so the handshake edge
+  starts a one-shot timer (TIM7, 300 µs) and the timer interrupt starts the transfer. The DMA
+  completion interrupt releases CS, accounts for the frames and starts the next transfer if the
+  coprocessor is ready again. TIM7 and the DMA streams (DMA2 streams 0 and 3) are set up in
+  `esp_spi.c`, not CubeMX, so regenerating the project leaves them alone. Don't enable them in CubeMX
+  as well.
+- The DMA receives straight into a queue of four frame buffers. **The main loop** checks each frame
+  and hands it to RPC or lwIP, so lwIP never runs in an interrupt. No transfer starts while all four
+  are full (every transfer receives a frame).
+- lwIP calls the web server and daytime client back (accept, receive, sent, DNS) from
+  `wifi_netif_poll()` in the main loop.
 
 ### Code: `sl_mcu_stm32f407_at`
 

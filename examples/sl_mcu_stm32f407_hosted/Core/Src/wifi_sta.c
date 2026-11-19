@@ -4,6 +4,17 @@
  * The coprocessor initialises its Wi-Fi driver itself at boot, so the host
  * only sets the mode, starts Wi-Fi, scans and connects. Message and field
  * numbers are from esp_hosted common/serializers/eh_proto_v2/src/proto/rpc_v2.proto.
+ *
+ * A state machine, one RPC request at a time: wifi_sta_poll() sends the
+ * request for the current state, and the response callback moves to the
+ * next state. The sequence is
+ *   WAIT_CP -> GET_FW -> SET_MODE -> GET_MAC -> START -> SET_PS -> SCAN ->
+ *   SCAN_WAIT -> SCAN_RESULTS -> SET_CONFIG -> CONNECT -> CONNECT_WAIT ->
+ *   CONNECTED
+ * Events (connected, disconnected, scan done, init) come in through
+ * wifi_sta_rpc_event(). A failed request or a silent coprocessor (no frame
+ * for LIVENESS_IDLE_MS, then a probe that times out) resets the coprocessor
+ * and starts over; a Wi-Fi disconnect retries the connect after a delay.
  */
 
 #include <stdio.h>
@@ -21,9 +32,10 @@
 #define RETRY_DELAY_MS          5000
 #define NOT_INIT_RETRY_MS       500
 #define LIVENESS_IDLE_MS        10000   // probe the coprocessor after this long without traffic
+#define RSSI_PERIOD_MS          30000   // ask for the AP's signal strength this often
 #define ESP_ERR_WIFI_NOT_INIT   0x3001  // CP announced itself before its app_main ran esp_wifi_init()
 
-/* wifi_event_t values (IDF esp_wifi_types.h) for Event_WifiEventNoArgs */
+/* wifi_event_t values (IDF esp_wifi_types.h) for Event_WifiEventNoArgs, for the log */
 static const char* wifi_event_name(int32_t id) {
     switch (id) {
     case 0: return "WIFI_READY";
@@ -36,22 +48,25 @@ static const char* wifi_event_name(int32_t id) {
     }
 }
 
+// wifi_auth_mode_t as text, for the scan list
 static const char* auth_name(int32_t a) {
     static const char *names[] = { "open", "wep", "wpa", "wpa2", "wpa/wpa2", "wpa2-ent", "wpa3", "wpa2/wpa3", "wapi", "owe", "wpa3-ent", "wpa3-ent-192" };
     return (a >= 0 && a < (int32_t) (sizeof(names) / sizeof(names[0]))) ? names[a] : "?";
 }
 
 static wifi_sta_state_t state;
-static const char *sta_ssid;
+static const char *sta_ssid;        // credentials from wifi_secrets.h
 static const char *sta_password;
 static uint8_t mac[6];
-static uint8_t cp_up;
-static uint8_t scan_done;
-static uint32_t retry_tick;
+static uint8_t cp_up;               // the coprocessor's RPC init event has arrived
+static uint8_t scan_done;           // scan done event seen
+static uint32_t retry_tick;         // RETRY_WAIT: go to retry_state after retry_delay
 static uint32_t retry_delay;
 static wifi_sta_state_t retry_state;
-static uint8_t req_in_flight;
+static uint8_t req_in_flight;       // a request of ours is waiting for its response
 static uint32_t last_probe_tick;
+static uint32_t last_rssi_tick;
+static int rssi;
 
 static void set_state(wifi_sta_state_t s) {
     state = s;
@@ -62,12 +77,14 @@ static void set_state(wifi_sta_state_t s) {
  * runs again once Wi-Fi is back. */
 static void restart_cp(void) {
     req_in_flight = 0;
+    rssi = 0;
     cp_up = 0;
     scan_done = 0;
     esp_host_restart_cp();
     set_state(WIFI_STA_WAIT_CP);
 }
 
+// Go to state s after delay_ms (via RETRY_WAIT).
 static void retry_later(wifi_sta_state_t s, uint32_t delay_ms) {
     retry_state = s;
     retry_delay = delay_ms;
@@ -75,6 +92,7 @@ static void retry_later(wifi_sta_state_t s, uint32_t delay_ms) {
     set_state(WIFI_STA_RETRY_WAIT);
 }
 
+// The esp_err_t result in a response: the varint in `field` (absent = 0).
 static int32_t resp_code(const uint8_t *body, size_t len, uint32_t field) {
     pb_reader_t r;
     pb_field_t f;
@@ -132,6 +150,7 @@ static void on_simple_resp(esp_rpc_status_t status, uint16_t msg_id, const uint8
     }
 }
 
+// Rpc_Resp_GetCoprocessorFwVersion: major/minor/patch in fields 2..4, target name in 9.
 static void on_fw_version(esp_rpc_status_t status, uint16_t msg_id, const uint8_t *body, size_t len) {
     (void) msg_id;
     req_in_flight = 0;
@@ -156,6 +175,7 @@ static void on_fw_version(esp_rpc_status_t status, uint16_t msg_id, const uint8_
     set_state(WIFI_STA_SET_MODE);
 }
 
+// Rpc_Resp_GetMacAddress: the 6 byte MAC in field 1 (lwIP needs it for the netif).
 static void on_mac(esp_rpc_status_t status, uint16_t msg_id, const uint8_t *body, size_t len) {
     (void) msg_id;
     req_in_flight = 0;
@@ -176,6 +196,7 @@ static void on_mac(esp_rpc_status_t status, uint16_t msg_id, const uint8_t *body
     set_state(WIFI_STA_START);
 }
 
+// One wifi_ap_record from the scan: bssid 1, ssid 2, channel 3, rssi 5, authmode 6.
 static void print_ap_record(const uint8_t *data, size_t len) {
     char ssid[33] = { 0 };
     uint8_t bssid[6] = { 0 };
@@ -209,6 +230,7 @@ static void print_ap_record(const uint8_t *data, size_t len) {
             bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], channel, rssi, auth_name(auth));
 }
 
+// Rpc_Resp_WifiScanGetApRecords: count in field 2, records in field 3.
 static void on_ap_records(esp_rpc_status_t status, uint16_t msg_id, const uint8_t *body, size_t len) {
     (void) msg_id;
     req_in_flight = 0;
@@ -232,6 +254,7 @@ static void on_ap_records(esp_rpc_status_t status, uint16_t msg_id, const uint8_
     set_state(WIFI_STA_SET_CONFIG);
 }
 
+// Liveness probe answered (or not).
 static void on_probe(esp_rpc_status_t status, uint16_t msg_id, const uint8_t *body, size_t len) {
     (void) msg_id;
     (void) body;
@@ -243,12 +266,40 @@ static void on_probe(esp_rpc_status_t status, uint16_t msg_id, const uint8_t *bo
     }
 }
 
+// Rpc_Resp_WifiStaGetApInfo { resp = 1; wifi_ap_record ap_record = 2 { ... rssi = 5 ... } }
+static void on_ap_info(esp_rpc_status_t status, uint16_t msg_id, const uint8_t *body, size_t len) {
+    (void) msg_id;
+    req_in_flight = 0;
+    if (status != ESP_RPC_OK) {
+        printf("wifi_sta: coprocessor not responding\n");
+        restart_cp();
+        return;
+    }
+    pb_reader_t r;
+    pb_field_t f;
+    pb_reader_init(&r, body, len);
+    while (pb_read_field(&r, &f) == 1) {
+        if (f.field == 2 && f.wire_type == PB_WT_LEN) {
+            pb_reader_t r2;
+            pb_field_t f2;
+            pb_reader_init(&r2, f.data, f.len);
+            while (pb_read_field(&r2, &f2) == 1) {
+                if (f2.field == 5) {
+                    rssi = pb_as_int32(&f2);
+                }
+            }
+        }
+    }
+}
+
+// Send a request; the callback clears req_in_flight.
 static void send(uint16_t msg_id, const uint8_t *body, size_t len, esp_rpc_resp_cb_t cb) {
     if (esp_rpc_request(msg_id, body, len, cb) == 0) {
         req_in_flight = 1;
     }
 }
 
+// RPC events from the coprocessor (registered with esp_rpc_init()).
 void wifi_sta_rpc_event(uint16_t msg_id, const uint8_t *body, size_t len) {
     pb_reader_t r;
     pb_field_t f;
@@ -295,6 +346,7 @@ void wifi_sta_rpc_event(uint16_t msg_id, const uint8_t *body, size_t len) {
             }
         }
         printf("wifi_sta: CONNECTED to \"%s\" on channel %lu\n", ssid, channel);
+        last_rssi_tick = HAL_GetTick() - RSSI_PERIOD_MS;  // ask right away
         set_state(WIFI_STA_CONNECTED);
         break;
     }
@@ -315,6 +367,7 @@ void wifi_sta_rpc_event(uint16_t msg_id, const uint8_t *body, size_t len) {
             }
         }
         printf("wifi_sta: disconnected, reason %lu - retrying in %u s\n", reason, RETRY_DELAY_MS / 1000);
+        rssi = 0;
         retry_later(WIFI_STA_CONNECT, RETRY_DELAY_MS);
         break;
     }
@@ -325,6 +378,7 @@ void wifi_sta_rpc_event(uint16_t msg_id, const uint8_t *body, size_t len) {
     }
 }
 
+// The network to join. The strings must stay valid (they're kept, not copied).
 void wifi_sta_init(const char *ssid, const char *password) {
     sta_ssid = ssid;
     sta_password = password;
@@ -334,6 +388,7 @@ void wifi_sta_init(const char *ssid, const char *password) {
     set_state(WIFI_STA_WAIT_CP);
 }
 
+// Main loop: liveness and RSSI checks, and the next request of the sequence.
 void wifi_sta_poll(void) {
     if (req_in_flight || esp_rpc_busy()) {
         return;
@@ -431,8 +486,14 @@ void wifi_sta_poll(void) {
         }
         break;
 
-    case WIFI_STA_CONNECT_WAIT:
     case WIFI_STA_CONNECTED:
+        if (now - last_rssi_tick > RSSI_PERIOD_MS) {
+            last_rssi_tick = now;
+            send(RPC_ID_WIFI_STA_GET_AP_INFO, NULL, 0, on_ap_info);
+        }
+        break;
+
+    case WIFI_STA_CONNECT_WAIT:
     case WIFI_STA_ERROR:
     default:
         break;
@@ -445,4 +506,12 @@ wifi_sta_state_t wifi_sta_get_state(void) {
 
 const uint8_t* wifi_sta_get_mac(void) {
     return mac;
+}
+
+const char* wifi_sta_get_ssid(void) {
+    return sta_ssid;
+}
+
+int wifi_sta_get_rssi(void) {
+    return rssi;
 }

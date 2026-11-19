@@ -71,12 +71,13 @@ static volatile size_t rx_head, rx_tail;    // head: written by IRQ, tail: by ma
 static uint8_t tx_ring[AT_SPI_TX_RING_SIZE];
 static volatile size_t tx_head, tx_tail;    // head: written by main, tail: by IRQ
 
-// DMA buffers (in SRAM, not CCM: the DMA can't reach CCM)
+// DMA buffers: header (3 bytes) + data for one transaction. In SRAM, not
+// CCM: the DMA can't reach CCM.
 static uint8_t dma_tx_buf[HDR_LEN + AT_SPI_MAX_CHUNK] __attribute__((aligned(4)));
 static uint8_t dma_rx_buf[HDR_LEN + AT_SPI_MAX_CHUNK] __attribute__((aligned(4)));
 
-static volatile xfer_state_t xstate;
-static volatile uint8_t hs_edge;
+static volatile xfer_state_t xstate;    // which transaction is on the wire
+static volatile uint8_t hs_edge;        // HS rose: read the status
 static volatile uint32_t xfer_tick;     // start of the transfer in progress
 static volatile uint32_t last_xfer_tick;
 static uint8_t send_seq;                // last write request sequence number
@@ -86,6 +87,7 @@ static uint16_t read_len;               // bytes the ESP announced
 static uint8_t write_requested;
 static uint32_t reset_tick;
 
+// Bytes in a ring buffer.
 static inline size_t ring_used(size_t head, size_t tail, size_t size) {
     return (head + size - tail) % size;
 }
@@ -119,6 +121,7 @@ static void start(xfer_state_t s, uint8_t cmd, uint8_t addr, uint16_t data_len) 
     }
 }
 
+// Bytes queued for the ESP.
 static int tx_pending(void) {
     return ring_used(tx_head, tx_tail, sizeof(tx_ring)) != 0;
 }
@@ -147,6 +150,8 @@ static void kick(void) {
     }
 }
 
+// kick() from the main loop: with interrupts off, so it can't race the
+// interrupt handlers that also call it.
 static void kick_from_main(void) {
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
@@ -154,6 +159,7 @@ static void kick_from_main(void) {
     __set_PRIMASK(primask);
 }
 
+// The status read finished: read the data the ESP has, or write ours.
 static void on_status(void) {
     const uint8_t *st = dma_rx_buf + HDR_LEN;
     uint8_t direction = st[0];
@@ -199,6 +205,7 @@ static void on_status(void) {
     }
 }
 
+// The data read finished: copy it into the RX ring, then say "read done".
 static void on_read_data(void) {
     size_t head = rx_head;
     for (uint16_t i = 0; i < read_len; ++i) {
@@ -215,6 +222,8 @@ static void on_read_data(void) {
     start(XS_RD_DONE, CMD_RD_DONE, 0, 0);
 }
 
+// HAL (DMA interrupt): a transaction finished. Release CS, take the next
+// step of the sequence, or start whatever else is waiting.
 void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
     if (hspi != spi) {
         return;
@@ -249,6 +258,7 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
     kick();
 }
 
+// HAL: the transfer failed (DMA or SPI error). Count it and carry on.
 void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi) {
     if (hspi != spi) {
         return;
@@ -259,6 +269,7 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi) {
     kick();
 }
 
+// HAL (EXTI interrupt): HS rose, the ESP wants attention.
 void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin) {
     if (gpio_pin == SPI1_HS_Pin) {
         hs_edge = 1;
@@ -266,6 +277,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin) {
     }
 }
 
+// The DMA stream interrupts (vector names from the startup file)
 void DMA2_Stream0_IRQHandler(void) {
     HAL_DMA_IRQHandler(&dma_rx);
 }
@@ -274,6 +286,8 @@ void DMA2_Stream3_IRQHandler(void) {
     HAL_DMA_IRQHandler(&dma_tx);
 }
 
+// DMA for SPI1: both directions byte wide, memory incrementing, normal
+// (not circular) mode, no FIFO.
 static void dma_init(void) {
     __HAL_RCC_DMA2_CLK_ENABLE();
 
@@ -304,6 +318,7 @@ static void dma_init(void) {
     HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
 }
 
+// Set up DMA and SPI1, then reset the ESP.
 void at_spi_init(SPI_HandleTypeDef *hspi) {
     spi = hspi;
     memset(&stats, 0, sizeof(stats));
@@ -314,6 +329,8 @@ void at_spi_init(SPI_HandleTypeDef *hspi) {
     at_spi_reset_esp();
 }
 
+// Pulse EN for 50 ms and start from a clean slate: no transfer, empty
+// rings, sequence numbers back to 0. Transfers wait BOOT_HOLD_MS after this.
 void at_spi_reset_esp(void) {
     // Stop the interrupt side first, then hold the ESP in reset.
     HAL_NVIC_DisableIRQ(EXTI4_IRQn);
@@ -343,6 +360,8 @@ void at_spi_reset_esp(void) {
     HAL_NVIC_EnableIRQ(EXTI4_IRQn);
 }
 
+// Main loop safety net: abort a stuck transfer, catch a missed HS edge, and
+// start work that no interrupt will (boot hold-off over, new TX data).
 void at_spi_poll(void) {
     uint32_t now = HAL_GetTick();
 
@@ -370,6 +389,7 @@ void at_spi_poll(void) {
     }
 }
 
+// Queue bytes for the ESP (main loop). Returns how many fitted.
 size_t at_spi_write(const void *data, size_t len) {
     const uint8_t *p = data;
     size_t n = 0;
@@ -389,10 +409,12 @@ size_t at_spi_write(const void *data, size_t len) {
     return n;
 }
 
+// Room left in the TX ring.
 size_t at_spi_tx_free(void) {
     return sizeof(tx_ring) - 1 - ring_used(tx_head, tx_tail, sizeof(tx_ring));
 }
 
+// Take received bytes (main loop). Returns how many were copied.
 size_t at_spi_read(void *data, size_t max) {
     uint8_t *p = data;
     size_t n = 0;
@@ -405,6 +427,7 @@ size_t at_spi_read(void *data, size_t max) {
     return n;
 }
 
+// Counters for the status line and page.
 const at_spi_stats_t* at_spi_get_stats(void) {
     return &stats;
 }

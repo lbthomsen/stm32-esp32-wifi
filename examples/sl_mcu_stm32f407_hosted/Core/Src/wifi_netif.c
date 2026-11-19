@@ -5,6 +5,12 @@
  * frames are copied into pbufs and queued; lwIP only sees them from
  * wifi_netif_poll() in the main loop, so lwIP is never re-entered from inside
  * its own transmit path.
+ *
+ * The interface follows the Wi-Fi state from wifi_sta: it is added and DHCP
+ * started on the first connect, and its link goes down and up with the
+ * connection (lwIP renews DHCP on link up). lwIP's timers (DHCP, ARP, TCP,
+ * DNS) run from sys_check_timeouts() here, so wifi_netif_poll() must be
+ * called often. lwIP runs with NO_SYS=1: everything in main loop context.
  */
 
 #include <stdio.h>
@@ -22,27 +28,30 @@
 #include "lwip/timeouts.h"
 #include "netif/ethernet.h"
 
-#define RX_QUEUE_LEN    8
-#define TX_WAIT_MS      20
+#define RX_QUEUE_LEN    8       // received frames waiting for lwIP
+#define TX_WAIT_MS      20      // how long a send may wait for room in the SPI queue
 
 static struct netif netif;
-static uint8_t netif_added;
+static uint8_t netif_added;     // netif_add() done (on the first Wi-Fi connect)
 static uint8_t link_up;
-static uint32_t last_ip;
+static uint32_t last_ip;        // IPv4 address in network order, 0 if none
 
 static struct pbuf *rx_queue[RX_QUEUE_LEN];
 static uint8_t rx_head, rx_tail, rx_count;
 static uint32_t rx_dropped;
 
-static uint8_t tx_frame[ESP_SPI_BUF_SIZE - ESP_SPI_HDR_SIZE];
+static uint8_t tx_frame[ESP_SPI_BUF_SIZE - ESP_SPI_HDR_SIZE];  // a pbuf chain flattened for sending
 static char hostname[16];
 
 /* lwIP platform hooks */
 
+// lwIP's millisecond clock
 uint32_t sys_now(void) {
     return HAL_GetTick();
 }
 
+// lwIP's random numbers (DHCP transaction IDs, TCP ports and sequence
+// numbers, DNS IDs): xorshift32 seeded from the tick and the MAC.
 uint32_t lwip_rand(void) {
     static uint32_t x;
     if (!x) {
@@ -56,6 +65,8 @@ uint32_t lwip_rand(void) {
 
 /* Data path */
 
+// Ethernet frame from the coprocessor (called from esp_spi_poll via
+// esp_host): copy it into a pbuf and queue it for wifi_netif_poll().
 static void sta_rx(const uint8_t *frame, uint16_t len) {
     if (rx_count >= RX_QUEUE_LEN || !netif_added) {
         ++rx_dropped;
@@ -72,6 +83,7 @@ static void sta_rx(const uint8_t *frame, uint16_t len) {
     ++rx_count;
 }
 
+// lwIP sends a frame: flatten the pbuf chain and queue it on the SPI link.
 static err_t linkoutput(struct netif *n, struct pbuf *p) {
     (void) n;
     if (p->tot_len > sizeof(tx_frame)) {
@@ -90,6 +102,7 @@ static err_t linkoutput(struct netif *n, struct pbuf *p) {
     return esp_spi_send(ESP_IF_STA, 0, 0, 0, tx_frame, len) == 0 ? ERR_OK : ERR_IF;
 }
 
+// lwIP reports address changes (DHCP bound, renewed, released).
 static void status_callback(struct netif *n) {
     uint32_t ip = ip4_addr_get_u32(netif_ip4_addr(n));
     if (ip != last_ip) {
@@ -104,6 +117,7 @@ static void status_callback(struct netif *n) {
     }
 }
 
+// Called by netif_add(): describe the interface to lwIP.
 static err_t netif_init_cb(struct netif *n) {
     n->name[0] = 'w';
     n->name[1] = 'l';
@@ -127,6 +141,8 @@ static void make_hostname(void) {
     snprintf(hostname, sizeof(hostname), "stm32-%06lx", id & 0xffffff);
 }
 
+// Initialise lwIP and hook the station data path. The interface itself is
+// added later, once Wi-Fi is up and the MAC address is known.
 void wifi_netif_init(void) {
     make_hostname();
     printf("wifi_netif: hostname %s\n", hostname);
@@ -134,6 +150,7 @@ void wifi_netif_init(void) {
     esp_host_set_sta_rx(sta_rx);
 }
 
+// Main loop: feed received frames to lwIP, follow the Wi-Fi state, run timers.
 void wifi_netif_poll(void) {
     // Feed received frames to lwIP.
     while (rx_count) {

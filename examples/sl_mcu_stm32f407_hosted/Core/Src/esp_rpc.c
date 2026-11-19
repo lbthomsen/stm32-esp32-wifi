@@ -1,5 +1,18 @@
 /*
  * esp_rpc.c - ESP-Hosted RPC (control path), host side (no RTOS).
+ *
+ * Requests: esp_rpc_request() wraps the encoded request message in the Rpc
+ * envelope (msg_type, msg_id, uid, body) and the two serial TLVs, and keeps
+ * it until esp_rpc_poll() can hand it to the SPI transport. Only one request
+ * is outstanding at a time; its callback runs when the matching response
+ * (msg_id + 0x100) arrives, or with ESP_RPC_TIMEOUT after ESP_RPC_TIMEOUT_MS.
+ *
+ * Receive: serial frames (if_type 3) are collected until a frame without
+ * the "more fragments" flag, then the TLVs are split and the Rpc envelope is
+ * decoded. Events ("RPCEvt" endpoint, or msg_type 3) go to the event
+ * callback, responses to the waiting request.
+ *
+ * Everything here runs in main loop context.
  */
 
 #include <stdio.h>
@@ -7,12 +20,15 @@
 #include "esp_rpc.h"
 #include "pb.h"
 
+/* Serial TLVs around each RPC message */
 #define TLV_EPNAME              0x01
 #define TLV_DATA                0x02
 
+/* Endpoint names: requests and responses use "RPCRsp", events "RPCEvt" */
 #define EP_REQ                  "RPCRsp"
 #define EP_EVT                  "RPCEvt"
 
+/* Rpc envelope (rpc_v2.proto): msg_type values and field numbers */
 #define RPC_TYPE_REQ            1
 #define RPC_TYPE_RESP           2
 #define RPC_TYPE_EVENT          3
@@ -21,27 +37,32 @@
 #define RPC_FIELD_MSG_ID        2
 #define RPC_FIELD_UID           3
 
+/* Frame header flag: the message continues in the next frame */
 #define FLAG_MORE_FRAGMENT      (1 << 0)
 
-#define RX_BUF_SIZE             4096
-#define TX_BUF_SIZE             512
+#define RX_BUF_SIZE             4096    // largest reassembled message (scan results are the big ones)
+#define TX_BUF_SIZE             512     // largest request (set config with SSID and password)
 
 static esp_rpc_event_cb_t event_callback;
 
+// Reassembly of a message split over several frames
 static uint8_t rx_buf[RX_BUF_SIZE];
 static size_t rx_len;
-static uint8_t rx_overflow;
+static uint8_t rx_overflow;     // the message didn't fit: drop it when complete
 
+// The encoded request, until the SPI transmit queue has room for it
 static uint8_t tx_buf[TX_BUF_SIZE];
 static size_t tx_len;
 static uint8_t tx_pending;
 
+// The outstanding request (req_msg_id 0: none)
 static uint32_t next_uid = 1;
 static uint16_t req_msg_id;
 static uint32_t req_uid;
 static uint32_t req_tick;
 static esp_rpc_resp_cb_t req_callback;
 
+// event_cb gets every RPC event from the coprocessor.
 void esp_rpc_init(esp_rpc_event_cb_t event_cb) {
     event_callback = event_cb;
     rx_len = 0;
@@ -51,6 +72,8 @@ void esp_rpc_init(esp_rpc_event_cb_t event_cb) {
     req_msg_id = 0;
 }
 
+// Forget the outstanding request (without calling back) and any partial
+// message, e.g. after the coprocessor was reset.
 void esp_rpc_reset(void) {
     rx_len = 0;
     rx_overflow = 0;
@@ -59,10 +82,15 @@ void esp_rpc_reset(void) {
     req_msg_id = 0;
 }
 
+// 1 while a request is waiting for its response.
 int esp_rpc_busy(void) {
     return req_msg_id != 0;
 }
 
+// Encode a request and queue it. Layout of tx_buf:
+//   [0x01][len16]["RPCRsp"] [0x02][len16][Rpc { msg_type, msg_id, uid, <msg_id>: body }]
+// The protobuf part is written first, at its final offset, because its
+// length goes into the TLV header in front of it.
 int esp_rpc_request(uint16_t msg_id, const uint8_t *body, size_t len, esp_rpc_resp_cb_t cb) {
     if (req_msg_id) {
         return -1;
@@ -102,6 +130,8 @@ int esp_rpc_request(uint16_t msg_id, const uint8_t *body, size_t len, esp_rpc_re
     return 0;
 }
 
+// End the outstanding request and run its callback. The request is
+// cleared first, so the callback may send the next one.
 static void finish_request(esp_rpc_status_t status, uint16_t msg_id, const uint8_t *body, size_t len) {
     esp_rpc_resp_cb_t cb = req_callback;
     req_msg_id = 0;
@@ -111,6 +141,8 @@ static void finish_request(esp_rpc_status_t status, uint16_t msg_id, const uint8
     }
 }
 
+// Main loop: send the queued request when the transport has room, and time
+// out a request that got no response.
 void esp_rpc_poll(void) {
     if (tx_pending && !esp_spi_tx_busy()) {
         if (esp_spi_send(ESP_IF_SERIAL, 0, 0, 0, tx_buf, (uint16_t) tx_len) == 0) {
@@ -125,6 +157,8 @@ void esp_rpc_poll(void) {
     }
 }
 
+// Decode one Rpc envelope. The body is the length delimited field whose
+// number equals msg_id (always >= 0x100), so any such field is the body.
 static void handle_rpc(const uint8_t *data, size_t len, int is_event) {
     pb_reader_t r;
     pb_field_t f;
@@ -172,6 +206,7 @@ static void handle_rpc(const uint8_t *data, size_t len, int is_event) {
     printf("esp_rpc: unexpected message type=%lu id=0x%03lx\n", msg_type, msg_id);
 }
 
+// Split a complete serial message into its TLVs: endpoint name and data.
 static void handle_serial(const uint8_t *buf, size_t len) {
     char ep[16] = { 0 };
     const uint8_t *data = NULL;
@@ -201,6 +236,8 @@ static void handle_serial(const uint8_t *buf, size_t len) {
     handle_rpc(data, data_len, strcmp(ep, EP_EVT) == 0);
 }
 
+// Frames from the serial interface (called by esp_host). Collects
+// fragments until the last one, then handles the whole message.
 void esp_rpc_rx(const esp_frame_t *frame) {
     if (rx_len + frame->len > sizeof(rx_buf)) {
         rx_overflow = 1;

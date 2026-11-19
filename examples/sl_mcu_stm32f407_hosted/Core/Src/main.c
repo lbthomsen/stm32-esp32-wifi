@@ -27,6 +27,8 @@
 #include "wifi_sta.h"
 #include "wifi_secrets.h"
 #include "wifi_netif.h"
+#include "http_server.h"
+#include "daytime.h"
 
 /* USER CODE END Includes */
 
@@ -66,7 +68,10 @@ static void MX_USART1_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-// Send printf to uart1
+// printf goes to USART1 (PA9/PA10, 921600 baud), which the ST-Link passes
+// on as its virtual COM port. newlib's _write() (syscalls.c) calls this for
+// every character; "\n" becomes "\r\n" for terminal programs. Blocking: a
+// long printf holds up the main loop (at 921600 baud, about 11 us per byte).
 int __io_putchar(int ch) {
     if (ch == '\n') {
         HAL_UART_Transmit(&huart1, (uint8_t*) "\r", 1, HAL_MAX_DELAY);
@@ -114,9 +119,13 @@ int main(void)
 
     printf("\n\n\nStarting Wi-Fi (ESP-Hosted)\n");
 
+    // Order matters: the RPC layer and Wi-Fi state machine first, then lwIP
+    // and the web server, then the transport, whose init resets the
+    // coprocessor through EN. Credentials: Core/Inc/wifi_secrets.h.
     esp_rpc_init(wifi_sta_rpc_event);
     wifi_sta_init(WIFI_SSID, WIFI_PASSWORD);
     wifi_netif_init();
+    http_server_init();
     esp_host_init(&hspi1);
 
   /* USER CODE END 2 */
@@ -124,6 +133,12 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
+    // The superloop. Nothing here blocks for long: every module keeps its own
+    // state and does a little work per call. The SPI transfers themselves
+    // run from interrupts (esp_spi.c); the main loop hands received frames
+    // to RPC and lwIP, and runs the services.
+    //  - The LED (PC13) blinks at 1 Hz: the loop is alive.
+    //  - A status line every 30 s on the console.
     uint32_t now, next_blink = 500, next_status = 30000;
 
     while (1) {
@@ -145,9 +160,10 @@ int main(void)
             next_status = now + 30000;
         }
 
-        esp_host_poll();
-        wifi_sta_poll();
-        wifi_netif_poll();
+        esp_host_poll();        // received frames to RPC/lwIP; the SPI transfers run from interrupts
+        wifi_sta_poll();        // Wi-Fi bring-up over RPC, liveness, RSSI
+        wifi_netif_poll();      // lwIP input and timers; the HTTP server runs in its callbacks
+        daytime_poll();         // NIST time every 10 minutes
 
     /* USER CODE END WHILE */
 

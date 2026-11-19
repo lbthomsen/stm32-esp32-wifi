@@ -29,6 +29,7 @@
 #define RPC_ID_WIFI_SCAN_START          0x11e
 #define RPC_ID_WIFI_SCAN_GET_AP_NUM     0x120
 #define RPC_ID_WIFI_SCAN_GET_AP_RECORDS 0x121
+#define RPC_ID_WIFI_STA_GET_AP_INFO     0x126
 #define RPC_ID_GET_CP_FW_VERSION        0x15e
 #define RPC_ID_RESP(req)                ((req) + 0x100)
 
@@ -50,13 +51,19 @@ typedef enum {
 typedef void (*esp_rpc_resp_cb_t)(esp_rpc_status_t status, uint16_t msg_id, const uint8_t *body, size_t len);
 typedef void (*esp_rpc_event_cb_t)(uint16_t msg_id, const uint8_t *body, size_t len);
 
+// event_cb gets every RPC event from the coprocessor.
 void esp_rpc_init(esp_rpc_event_cb_t event_cb);
+
+// Main loop: send the queued request, time out an unanswered one.
 void esp_rpc_poll(void);
+
+// Serial interface frames from esp_host (reassembled into messages here).
 void esp_rpc_rx(const esp_frame_t *frame);
 
 // Send a request. body is the encoded request message (may be empty).
 // Returns 0 if accepted, -1 if a request is already outstanding, -2 if too big.
 int esp_rpc_request(uint16_t msg_id, const uint8_t *body, size_t len, esp_rpc_resp_cb_t cb);
+// 1 while a request is waiting for its response.
 int esp_rpc_busy(void);
 
 // Drop any outstanding request (no callback) and partial frames, e.g. after a coprocessor reset.

@@ -5,6 +5,16 @@
  *  - "+IPD,<link>,<len>:" is followed by <len> raw bytes (socket data).
  *  - After AT+CIPSEND the ESP sends "OK" and then a bare '>' prompt; the
  *    host then sends the raw data and gets "Recv N bytes" and "SEND OK".
+ *
+ * Incoming bytes go through a small parser (rx_byte): normally it collects
+ * a line; "+IPD,...:" switches it to counting out raw socket data; a '>'
+ * while waiting for the CIPSEND prompt releases the payload. Each complete
+ * line is either an unsolicited result code (URC: "ready", "WIFI ...",
+ * "<link>,CONNECT", ...) for the URC callback, or part of the response to
+ * the command in progress: the final "OK"/"ERROR" ends the command, other
+ * lines go to its line callback.
+ *
+ * Runs in main loop context: at_client_poll() takes what at_spi received.
  */
 
 #include <stdio.h>
@@ -14,6 +24,7 @@
 #include "at_client.h"
 #include "at_spi.h"
 
+// Where the command in progress is
 typedef enum {
     CMD_IDLE = 0,
     CMD_WAIT_FINAL,     // waiting for OK / ERROR
@@ -24,12 +35,14 @@ typedef enum {
 static at_urc_cb_t urc_callback;
 static at_ipd_cb_t ipd_callback;
 
+// The command in progress
 static cmd_state_t cmd_state;
 static at_line_cb_t line_callback;
 static at_done_cb_t done_callback;
-static uint32_t cmd_tick;
+static uint32_t cmd_tick;           // when it was sent
 static uint32_t cmd_timeout;
 
+// The line being received
 static char line[AT_LINE_MAX];
 static size_t line_len;
 
@@ -47,6 +60,7 @@ static size_t send_len;
 
 static uint32_t last_rx_tick;
 
+// Result as text, for the logs.
 const char* at_result_name(at_result_t r) {
     switch (r) {
     case AT_OK: return "OK";
@@ -57,6 +71,8 @@ const char* at_result_name(at_result_t r) {
     }
 }
 
+// End the command in progress and run its done callback. The state is
+// cleared first, so the callback may send the next command.
 static void finish(at_result_t result) {
     at_done_cb_t cb = done_callback;
     cmd_state = CMD_IDLE;
@@ -80,6 +96,7 @@ static int is_urc(const char *s) {
     return 0;
 }
 
+// A complete line (without "\r\n"): URC, or part of the current response.
 static void handle_line(const char *s) {
     if (s[0] == 0) {
         return;
@@ -150,6 +167,8 @@ static void start_ipd(void) {
     line_len = 0;
 }
 
+// One byte of +IPD data: buffer it and pass it on per AT_IPD_CHUNK, or at
+// the end of the packet.
 static void ipd_byte(uint8_t b) {
     ipd_buf[ipd_fill++] = b;
     ipd_got++;
@@ -164,6 +183,7 @@ static void ipd_byte(uint8_t b) {
     }
 }
 
+// The parser: one byte from the ESP.
 static void rx_byte(uint8_t b) {
     if (in_ipd) {
         ipd_byte(b);
@@ -195,6 +215,7 @@ static void rx_byte(uint8_t b) {
     }
 }
 
+// urc_cb gets unsolicited lines, ipd_cb socket data.
 void at_client_init(at_urc_cb_t urc_cb, at_ipd_cb_t ipd_cb) {
     urc_callback = urc_cb;
     ipd_callback = ipd_cb;
@@ -211,6 +232,7 @@ void at_client_reset(void) {
     last_rx_tick = HAL_GetTick();
 }
 
+// Main loop: parse what the transport received; time out the command.
 void at_client_poll(void) {
     uint8_t buf[64];
     size_t n;
@@ -226,10 +248,12 @@ void at_client_poll(void) {
     }
 }
 
+// 1 while a command is in progress.
 int at_client_busy(void) {
     return cmd_state != CMD_IDLE;
 }
 
+// Queue "cmd\r\n" for the ESP and wait for its final result.
 int at_client_command(const char *cmd, uint32_t timeout_ms, at_line_cb_t line_cb, at_done_cb_t done_cb) {
     if (cmd_state != CMD_IDLE) {
         return -1;
@@ -249,6 +273,8 @@ int at_client_command(const char *cmd, uint32_t timeout_ms, at_line_cb_t line_cb
     return 0;
 }
 
+// AT+CIPSEND=<link>,<len>. The payload is copied now and sent when the '>'
+// prompt arrives; done_cb gets AT_OK on "SEND OK".
 int at_client_send(int link, const uint8_t *data, size_t len, uint32_t timeout_ms, at_done_cb_t done_cb) {
     if (len == 0 || len > sizeof(send_buf)) {
         return -2;
@@ -265,6 +291,7 @@ int at_client_send(int link, const uint8_t *data, size_t len, uint32_t timeout_m
     return r;
 }
 
+// HAL tick of the last byte from the ESP (for the liveness check).
 uint32_t at_client_last_rx(void) {
     return last_rx_tick;
 }

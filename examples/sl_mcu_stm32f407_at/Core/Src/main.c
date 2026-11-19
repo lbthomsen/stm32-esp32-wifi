@@ -67,7 +67,10 @@ static void MX_USART1_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-// Send printf to uart1
+// printf goes to USART1 (PA9/PA10, 921600 baud), which the ST-Link passes
+// on as its virtual COM port. newlib's _write() (syscalls.c) calls this for
+// every character; "\n" becomes "\r\n" for terminal programs. Blocking: a
+// long printf holds up the main loop (at 921600 baud, about 11 us per byte).
 int __io_putchar(int ch) {
     if (ch == '\n') {
         HAL_UART_Transmit(&huart1, (uint8_t*) "\r", 1, HAL_MAX_DELAY);
@@ -115,6 +118,8 @@ int main(void)
 
     printf("\n\n\nStarting Wi-Fi (ESP-AT)\n");
 
+    // Wi-Fi first (it registers the AT callbacks), then the transport, whose
+    // init resets the ESP through EN. Credentials: Core/Inc/wifi_secrets.h.
     wifi_at_init(WIFI_SSID, WIFI_PASSWORD, HTTP_SERVER_PORT, &http_server_handler);
     at_spi_init(&hspi1);
 
@@ -123,6 +128,12 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
+    // The superloop. Nothing here blocks for long: every module keeps its own
+    // state and does a little work per call. The SPI transfers themselves
+    // run from interrupts (at_spi.c); the main loop parses what they bring
+    // in and runs the services.
+    //  - The LED (PC13) blinks at 1 Hz: the loop is alive.
+    //  - A status line every 30 s on the console.
     uint32_t now, next_blink = 500, next_status = 30000;
 
     while (1) {

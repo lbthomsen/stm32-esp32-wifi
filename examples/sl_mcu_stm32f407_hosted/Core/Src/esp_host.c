@@ -8,6 +8,15 @@
  *  2. The host answers with a PRIV frame carrying event 0x22 and its own
  *     TLVs: host capabilities, echoed chip id, raw throughput test mode,
  *     throttle thresholds and (if advertised) the RPC wire version.
+ *  3. The coprocessor then sends the RPC "ESP init" event and accepts RPC
+ *     requests (esp_rpc) and network frames (wifi_netif).
+ *
+ * Received frames are routed by interface type: PRIV (init) is handled
+ * here, SERIAL goes to esp_rpc, STA (Ethernet frames) to the netif.
+ * If no init event arrives, the host first asks for one (wake flag) and
+ * then resets the coprocessor through EN.
+ *
+ * Runs in main loop context (frames arrive through esp_spi_poll()).
  */
 
 #include <stdio.h>
@@ -44,17 +53,18 @@
 #define FLAG_POWER_SAVE_STOPPED         (1 << 3)
 #define TEST_RAW_TP_NONE                0x00
 
-static esp_host_info_t info;
-static uint8_t init_reply_pending;
+static esp_host_info_t info;           // what the coprocessor announced
+static uint8_t init_reply_pending;      // init event seen, reply not queued yet
 static esp_host_data_rx_cb_t sta_rx_callback;
 static uint32_t init_wait_start;
 
-#define ESP_HOST_INIT_TIMEOUT_MS 4000
-#define ESP_HOST_WAKE_AFTER_MS 2000
+#define ESP_HOST_INIT_TIMEOUT_MS 4000   // no init event this long after a reset: reset again
+#define ESP_HOST_WAKE_AFTER_MS 2000     // no init event this long: ask for one
 
 static uint8_t wake_sent;
-static uint32_t last_rx_tick;
+static uint32_t last_rx_tick;           // for the liveness check in wifi_sta
 
+// A little endian TLV value of 1 to 4 bytes.
 static uint32_t tlv_u32(const uint8_t *v, uint8_t len) {
     uint32_t r = 0;
     for (uint8_t i = 0; i < len && i < 4; ++i) {
@@ -63,6 +73,8 @@ static uint32_t tlv_u32(const uint8_t *v, uint8_t len) {
     return r;
 }
 
+// The coprocessor's init event: record what it announced and schedule the
+// host's reply (sent from esp_host_poll once the transmit queue has room).
 static void handle_init_event(const uint8_t *tlv, uint16_t len) {
     if (info.ready) {
         // The coprocessor restarted on its own (crash, watchdog, brownout).
@@ -126,6 +138,10 @@ static void handle_init_event(const uint8_t *tlv, uint16_t len) {
     init_reply_pending = 1;
 }
 
+// Queue the host's answer to the init event:
+//   [0x22][len] then TLVs [tag][1][value] for capabilities (none), the chip id
+//   we received, raw throughput test off, flow control thresholds (off), and
+//   RPC v2 if the coprocessor offered a version.
 static int send_init_reply(void) {
     uint8_t buf[32];
     uint8_t *p = buf;
@@ -164,10 +180,13 @@ static int send_init_reply(void) {
     return esp_spi_send(ESP_IF_PRIV, 0, 0, 0, buf, (uint16_t) (p - buf));
 }
 
+// An empty PRIV frame with the "power save stopped" flag: the coprocessor
+// answers with a fresh init event.
 static void send_wake(void) {
     esp_spi_send(ESP_IF_PRIV, 0, FLAG_POWER_SAVE_STOPPED, 0, NULL, 0);
 }
 
+// Every good frame from the transport lands here; route it by interface.
 static void host_rx(const esp_frame_t *frame) {
     last_rx_tick = HAL_GetTick();
 
@@ -195,11 +214,13 @@ static void host_rx(const esp_frame_t *frame) {
             frame->if_type, frame->if_num, frame->flags, frame->pkt_type, frame->len);
 }
 
+// Set up the transport and reset the coprocessor (a clean start every time).
 void esp_host_init(SPI_HandleTypeDef *hspi) {
     esp_spi_init(hspi, host_rx);
     esp_host_restart_cp();
 }
 
+// Main loop: received frames, RPC, the init handshake and its timeouts.
 void esp_host_poll(void) {
     esp_spi_poll();
 
@@ -233,6 +254,7 @@ void esp_host_poll(void) {
     }
 }
 
+// Reset the coprocessor through EN and start the handshake over.
 void esp_host_restart_cp(void) {
     printf("esp_host: resetting coprocessor\n");
     memset(&info, 0, sizeof(info));
@@ -243,14 +265,17 @@ void esp_host_restart_cp(void) {
     init_wait_start = HAL_GetTick();
 }
 
+// HAL tick of the last frame received.
 uint32_t esp_host_last_rx(void) {
     return last_rx_tick;
 }
 
+// Where Ethernet frames from the station interface go (wifi_netif).
 void esp_host_set_sta_rx(esp_host_data_rx_cb_t cb) {
     sta_rx_callback = cb;
 }
 
+// What the coprocessor announced in its init event.
 const esp_host_info_t* esp_host_get_info(void) {
     return &info;
 }

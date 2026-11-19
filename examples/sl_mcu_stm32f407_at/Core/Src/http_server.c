@@ -1,5 +1,14 @@
 /*
  * http_server.c - minimal HTTP/1.0 status page server over ESP-AT (no RTOS).
+ *
+ * One connection's life (per ESP-AT link):
+ *   on_connect   CONNECT event: start collecting the request
+ *   on_data      +IPD data: request line and headers; READY at the blank line
+ *   poll         READY: AT+CIPSEND the reply -> SENDING -> CLOSE:
+ *                AT+CIPCLOSE -> CLOSING -> FREE
+ *   on_closed    CLOSED event (client hung up, or after our close): FREE
+ * Only one AT command runs at a time, so http_server_poll() handles one
+ * connection step per call.
  */
 
 #include <stdarg.h>
@@ -50,17 +59,21 @@ const wifi_at_link_handler_t http_server_handler = {
     .on_closed = on_closed,
 };
 
+// Change a connection's state and note when (for the request timeout).
 static void set_conn(int link, conn_state_t s) {
     conns[link].state = s;
     conns[link].tick = HAL_GetTick();
 }
 
+// wifi_at: a client connected on this link.
 static void on_connect(int link) {
     conn_t *c = &conns[link];
     memset(c, 0, sizeof(*c));
     set_conn(link, CONN_RECV);
 }
 
+// wifi_at: data on this link. Collects the request line and watches for
+// the blank line that ends the headers.
 static void on_data(int link, const uint8_t *data, size_t len) {
     conn_t *c = &conns[link];
     if (c->state != CONN_RECV) {
@@ -87,11 +100,12 @@ static void on_data(int link, const uint8_t *data, size_t len) {
     }
 }
 
+// wifi_at: the link closed.
 static void on_closed(int link) {
     conns[link].state = CONN_FREE;
 }
 
-// Bounded append to body
+// Bounded printf-style append to body (truncates instead of overflowing).
 static size_t body_len;
 static void add(const char *fmt, ...) {
     va_list ap;
@@ -106,6 +120,7 @@ static void add(const char *fmt, ...) {
     }
 }
 
+// One table row: name and a printf-formatted value.
 static void add_row(const char *name, const char *fmt, ...) {
     char value[128];
     va_list ap;
@@ -115,6 +130,7 @@ static void add_row(const char *name, const char *fmt, ...) {
     add("<tr><td>%s</td><td>%s</td></tr>\n", name, value);
 }
 
+// The HTML status page, into body. Plain HTML with a 10 s auto-refresh.
 static void build_status_page(void) {
     uint32_t up = HAL_GetTick() / 1000;
     uint32_t now;
@@ -152,6 +168,7 @@ static void build_status_page(void) {
     add("</table>\n</body></html>\n");
 }
 
+// The reply to the request in c, in `response`. Returns its length.
 static size_t build_response(conn_t *c) {
     char method[8] = "";
     char path[REQ_LINE_MAX] = "";
@@ -187,6 +204,7 @@ static size_t build_response(conn_t *c) {
     return len;
 }
 
+// AT+CIPSEND finished: close the link next.
 static void on_sent(at_result_t r) {
     int link = busy_link;
     busy_link = -1;
@@ -198,6 +216,7 @@ static void on_sent(at_result_t r) {
     }
 }
 
+// AT+CIPCLOSE finished.
 static void on_close_done(at_result_t r) {
     (void) r;
     int link = busy_link;
@@ -207,6 +226,7 @@ static void on_close_done(at_result_t r) {
     }
 }
 
+// Main loop: the next AT step of one connection (timeout, reply, close).
 void http_server_poll(void) {
     uint32_t now = HAL_GetTick();
 
@@ -252,6 +272,7 @@ void http_server_poll(void) {
     }
 }
 
+// Requests answered since start-up.
 uint32_t http_server_requests(void) {
     return requests;
 }
